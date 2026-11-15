@@ -13,7 +13,9 @@ Phases 1 to 3 of the roadmap are built and tested (62 tests, all passing):
 - Walk-forward evaluation in month-based windows with per-window and aggregate metrics
 - Risk-aware PPO on Burn 0.22 (flex CPU backend): five allocation actions (0/25/50/75/100%), regime observations (returns, volatility, volume ratio, MACD histogram, RSI, position, drawdown), reward with cost-aware growth minus excess-drawdown, turnover, and volatility penalties, seeded and reproducible, checkpoints in burnpack with JSON metadata
 
-Not built yet: the risk engine and Barter integration, the experiment manager with redb storage, the Dioxus desktop UI, and Alpaca paper-trading order deployment.
+- Dioxus 0.7 desktop dashboard (`paperrl-desktop`): sidebar shell, live paper-account cards, SVG candlestick chart with hover OHLC, strategy comparison and walk-forward tables, a Markets browser over cached datasets, and an Experiments page that reads checkpoint metadata and draws training curves
+
+Not built yet: the risk engine and Barter integration, the experiment manager with redb storage, and Alpaca paper-trading order deployment (the UI reads the account; it cannot place orders).
 
 ## Results
 
@@ -33,6 +35,24 @@ PPO leads every baseline beside Buy & Hold and volatility targeting on raw retur
 Seed spreads on five stocks show the variation the architecture doc asked to record: NVDA ranges 129% to 193% across seeds, AAPL 43.6% to 65.4%, JPM 60.1% to 90.2%, WMT 74.5% to 111.8%, while KO converged identically.
 
 Read these numbers with the caveats they deserve. Three years of a bull-heavy sample favor Buy & Hold; the PPO walk-forward windows are not strictly out-of-sample because the agent trained on the full range; and drawdown and exposure were only recorded for Buy & Hold and PPO in this run. The full per-stock data is in `experiments/`, including `benchmark-27stocks-v2-risk-aware-ppo.csv`, `seeds-5stocks-v2.csv`, and `walkforward-27stocks-v2.csv`.
+
+## Desktop dashboard
+
+```
+cargo run -p paperrl-desktop
+```
+
+Five pages share the CLI's engine crates:
+
+| Page | What it shows |
+|---|---|
+| Dashboard | selected dataset stats, last 120 candles with hover OHLC and a volume strip, the live paper-account card, and a strategy comparison with PPO included when a checkpoint exists |
+| Markets | every cached dataset with bar counts and date ranges; click to chart it |
+| Strategy Lab | editable cash, fee, and slippage; run the full comparison and six-month walk-forward aggregates |
+| Experiments | checkpoints with seed, iterations, window, final reward, training-curve sparkline, and one-click backtest against the baselines |
+| Settings | paths, credential status, and the paper-only safety model |
+
+The window launched and the account card fetched the live paper account in a smoke run; automated tests cover the data layer (dataset scanning, chart geometry, sparklines, money formatting).
 
 ## Speed
 
@@ -78,6 +98,7 @@ Training and backtesting work offline from the cached Parquet datasets; only syn
 | paperrl-sim | Simulator, Portfolio accounting, strategies, walk-forward |
 | paperrl-rl | Feature engine, TradingEnv, and the PPO agent |
 | paperrl-cli | The `paperrl` binary |
+| paperrl-desktop | Dioxus dashboard |
 
 Datasets land in `datasets/`, model checkpoints and their JSON metadata in `models/`. Both are gitignored.
 

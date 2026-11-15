@@ -1,0 +1,25 @@
+[package]
+name = "paperrl-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "paperrl-desktop"
+path = "src/main.rs"
+
+[lib]
+name = "paperrl_desktop"
+path = "src/lib.rs"
+
+[dependencies]
+paperrl-core = { workspace = true }
+paperrl-data = { workspace = true }
+paperrl-sim = { workspace = true }
+paperrl-alpaca = { workspace = true }
+paperrl-rl = { workspace = true }
+dioxus = { version = "0.7", features = ["desktop"] }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
