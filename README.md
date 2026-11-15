@@ -65,6 +65,12 @@ Known limits: leveraged single-stock ETFs (TSLL, TSLG and similar) pass the pric
 
 ## Desktop dashboard
 
+![Dashboard](screenshots/dashboard.png)
+
+![Automation](screenshots/automation.png)
+
+![Experiments](screenshots/experiments.png)
+
 ```
 cargo run -p paperrl-desktop
 ```

@@ -11,7 +11,27 @@ use paperrl_desktop::{
 };
 
 fn main() {
-    dioxus::launch(App);
+    // PAPERRL_START_PAGE lets screenshots and demos open a specific page.
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(
+            dioxus::desktop::Config::new().with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title("PaperRL")
+                    .with_inner_size(dioxus::desktop::LogicalSize::new(1280.0, 800.0)),
+            ),
+        )
+        .launch(App);
+}
+
+fn initial_page() -> Page {
+    match std::env::var("PAPERRL_START_PAGE").as_deref() {
+        Ok("markets") => Page::Markets,
+        Ok("lab") => Page::Lab,
+        Ok("automation") => Page::Automation,
+        Ok("experiments") => Page::Experiments,
+        Ok("settings") => Page::Settings,
+        _ => Page::Dashboard,
+    }
 }
 
 const DATASETS_ROOT: &str = "datasets";
@@ -67,9 +87,19 @@ fn Logo() -> Element {
 
 #[allow(non_snake_case)]
 fn App() -> Element {
-    let mut page = use_signal(|| Page::Dashboard);
+    let mut page = use_signal(initial_page);
     let datasets = use_signal(|| list_datasets(Path::new(DATASETS_ROOT)));
-    let sel = use_signal(|| 0usize);
+    let sel = use_signal(|| {
+        // PAPERRL_START_SYMBOL preselects a dataset for screenshots and demos.
+        let list = datasets.read();
+        match std::env::var("PAPERRL_START_SYMBOL") {
+            Ok(sym) => {
+                let sym = sym.to_uppercase();
+                list.iter().position(|d| d.symbol == sym).unwrap_or(0)
+            }
+            Err(_) => 0,
+        }
+    });
 
     let body = match *page.read() {
         Page::Dashboard => rsx! { DashboardPage { datasets, sel } },
@@ -305,7 +335,7 @@ fn CandleChart(bars: Vec<paperrl_core::Bar>) -> Element {
         return rsx! { div { class: "muted-note", "No bars to chart." } };
     }
     let width = 900.0_f64;
-    let height = 320.0_f64;
+    let height = 250.0_f64;
     let geom = chart_geometry(&bars, width, height);
     let last = bars.last().cloned().unwrap_or(bars[0]);
     let hover_bar = hovered().and_then(|i| bars.get(i).cloned());
@@ -331,9 +361,9 @@ fn CandleChart(bars: Vec<paperrl_core::Bar>) -> Element {
                 }
             }
             svg {
-                view_box: "0 0 900 320",
+                view_box: "0 0 900 250",
                 width: "100%",
-                height: "320",
+                height: "250",
                 style: "display: block;",
                 line {
                     x1: "0", y1: "{geom.price_bottom:.1}", x2: "900", y2: "{geom.price_bottom:.1}",
