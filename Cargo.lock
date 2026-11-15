@@ -7193,6 +7193,7 @@ dependencies = [
  "paperrl-data",
  "paperrl-rl",
  "paperrl-sim",
+ "paperrl-trade",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7229,6 +7230,7 @@ dependencies = [
  "paperrl-data",
  "paperrl-rl",
  "paperrl-sim",
+ "paperrl-trade",
  "serde_json",
  "tokio",
 ]
@@ -7254,6 +7256,18 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "paperrl-core",
+]
+
+[[package]]
+name = "paperrl-trade"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "paperrl-alpaca",
+ "paperrl-core",
+ "paperrl-data",
+ "paperrl-rl",
+ "paperrl-sim",
 ]
 
 [[package]]

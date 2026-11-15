@@ -13,9 +13,10 @@ Phases 1 to 3 of the roadmap are built and tested (62 tests, all passing):
 - Walk-forward evaluation in month-based windows with per-window and aggregate metrics
 - Risk-aware PPO on Burn 0.22 (flex CPU backend): five allocation actions (0/25/50/75/100%), regime observations (returns, volatility, volume ratio, MACD histogram, RSI, position, drawdown), reward with cost-aware growth minus excess-drawdown, turnover, and volatility penalties, seeded and reproducible, checkpoints in burnpack with JSON metadata
 
-- Dioxus 0.7 desktop dashboard (`paperrl-desktop`): sidebar shell, live paper-account cards, SVG candlestick chart with hover OHLC, strategy comparison and walk-forward tables, a Markets browser over cached datasets, and an Experiments page that reads checkpoint metadata and draws training curves
+- Dioxus 0.7 desktop dashboard (`paperrl-desktop`): branded sidebar shell, live paper-account cards, SVG candlestick chart with hover OHLC, strategy comparison and walk-forward tables, a Markets browser over cached datasets, an Experiments page with training curves and one-click model backtests, and an Automation page that runs the same paper-trading pass as the CLI
+- Automated paper trading (`paperrl-trade`): momentum screen over the most active universe with liquidity filters, optional per-symbol PPO sizing, a deterministic risk gate, and Alpaca paper order submission with client order IDs, idempotent passes, and an audit log
 
-Not built yet: the risk engine and Barter integration, the experiment manager with redb storage, and Alpaca paper-trading order deployment (the UI reads the account; it cannot place orders).
+Not built yet: continuous position reconciliation and monitoring daemon, the experiment manager with redb storage, and Barter integration.
 
 ## Results
 
@@ -35,6 +36,32 @@ PPO leads every baseline beside Buy & Hold and volatility targeting on raw retur
 Seed spreads on five stocks show the variation the architecture doc asked to record: NVDA ranges 129% to 193% across seeds, AAPL 43.6% to 65.4%, JPM 60.1% to 90.2%, WMT 74.5% to 111.8%, while KO converged identically.
 
 Read these numbers with the caveats they deserve. Three years of a bull-heavy sample favor Buy & Hold; the PPO walk-forward windows are not strictly out-of-sample because the agent trained on the full range; and drawdown and exposure were only recorded for Buy & Hold and PPO in this run. The full per-stock data is in `experiments/`, including `benchmark-27stocks-v2-risk-aware-ppo.csv`, `seeds-5stocks-v2.csv`, and `walkforward-27stocks-v2.csv`.
+
+## Automated paper trading
+
+Two commands cover the workflow. Both require `APCA_API_KEY_ID` / `APCA_API_SECRET` and use the paper endpoint only.
+
+```
+# Screen the top 100 most active symbols and train this year's PPO models for the top 3 gainers
+paperrl trade scan --top 100 --train-top 3 --iters 150 --since 2026-01-01
+
+# Plan one pass (dry run by default)
+paperrl trade auto --top 100 --long 3
+
+# Submit the planned orders to the paper account (explicit activation)
+paperrl trade auto --top 100 --long 3 --execute
+
+# Keep running every five minutes until stopped
+paperrl trade auto --top 100 --long 3 --execute --interval 300
+```
+
+How a pass works: it pulls the screener's most active symbols plus current movers, refreshes daily bars for anything missing or older than five days, ranks the universe by blended 20-day and 5-day momentum, sells positions whose momentum turned or dropped out of the top list, and buys the leading gainers. Liquidity filters drop names below $5 or under $2M average daily dollar volume, which keeps penny stocks and warrants out. When a `ppo-SYMBOL-42.bpk` checkpoint exists, its current target weight scales that symbol's allocation; otherwise the planner uses half of the per-position cap.
+
+The risk gate caps position count, per-position size as a fraction of equity, per-order notional, and total spend by available cash; it never uses leverage. Symbols with open orders are treated as held, so re-running a pass cannot duplicate a buy or a sell. Every submitted order carries a `paperrl-` client order ID and is appended to `logs/orders.csv`.
+
+Live verification on 2026-11-15: a scan over a 190-symbol universe (most actives plus movers) ranked the leaders and trained three this-year models; the first automated pass submitted three paper buys of $2,000 each, all Accepted, and the account's buying power dropped by exactly $6,000 while positions stayed empty because the market was closed. A second pass immediately afterwards planned zero orders.
+
+Known limits: leveraged single-stock ETFs (TSLL, TSLG and similar) pass the price and volume filters and can dominate momentum rankings; add an exclusion list before treating the paper results as investment evidence. Orders submitted outside market hours are queued by Alpaca for the next session.
 
 ## Desktop dashboard
 
@@ -98,6 +125,7 @@ Training and backtesting work offline from the cached Parquet datasets; only syn
 | paperrl-sim | Simulator, Portfolio accounting, strategies, walk-forward |
 | paperrl-rl | Feature engine, TradingEnv, and the PPO agent |
 | paperrl-cli | The `paperrl` binary |
+| paperrl-trade | Momentum screen, risk gate, paper executor |
 | paperrl-desktop | Dioxus dashboard |
 
 Datasets land in `datasets/`, model checkpoints and their JSON metadata in `models/`. Both are gitignored.

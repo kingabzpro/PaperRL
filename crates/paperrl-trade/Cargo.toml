@@ -1,0 +1,13 @@
+[package]
+name = "paperrl-trade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+paperrl-core = { workspace = true }
+paperrl-alpaca = { workspace = true }
+paperrl-data = { workspace = true }
+paperrl-sim = { workspace = true }
+paperrl-rl = { workspace = true }
+chrono = { workspace = true }

@@ -14,6 +14,7 @@ paperrl-alpaca = { workspace = true }
 paperrl-data = { workspace = true }
 paperrl-sim = { workspace = true }
 paperrl-rl = { workspace = true }
+paperrl-trade = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }

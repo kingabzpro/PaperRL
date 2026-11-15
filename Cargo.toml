@@ -8,6 +8,7 @@ members = [
     "crates/paperrl-rl",
     "crates/paperrl-cli",
     "crates/paperrl-desktop",
+    "crates/paperrl-trade",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ paperrl-data = { path = "crates/paperrl-data" }
 paperrl-sim = { path = "crates/paperrl-sim" }
 paperrl-rl = { path = "crates/paperrl-rl" }
 paperrl-desktop = { path = "crates/paperrl-desktop" }
+paperrl-trade = { path = "crates/paperrl-trade" }
 # Pre-1.0 SDK: pinned exactly and isolated behind paperrl-alpaca.
 alpacars = "=0.8.0"
 anyhow = "1"

@@ -3,12 +3,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use paperrl_alpaca::{AlpacaClient, Credentials};
 use paperrl_core::{Bar, Symbol, Timeframe};
 use paperrl_data::BarStore;
 use paperrl_rl::{EnvConfig, PpoConfig, PpoStrategy, train_ppo};
+use paperrl_trade::{
+    AutoConfig, RiskLimits, ScreenFilter, collect_universe, ensure_universe_bars, rank_filtered,
+    run_once,
+};
 use paperrl_sim::{
     BuyHold, EmaCross, MeanReversion, Momentum, SimConfig, Strategy, VolTarget,
 };
@@ -31,6 +35,11 @@ enum Cmd {
     Alpaca {
         #[command(subcommand)]
         cmd: AlpacaCmd,
+    },
+    /// Automated paper trading: momentum screen plus risk-gated orders
+    Trade {
+        #[command(subcommand)]
+        cmd: TradeCmd,
     },
     /// Train an RL agent locally on stored bars
     Train {
@@ -127,6 +136,69 @@ impl std::fmt::Display for Strat {
 }
 
 #[derive(Subcommand)]
+enum TradeCmd {
+    /// Screen the most active universe, rank momentum, optionally train this year's PPO models
+    Scan {
+        /// Universe size (most active symbols), 25 to 500
+        #[arg(long, default_value_t = 100)]
+        top: u32,
+        /// Train PPO models for this many top gainers on bars since --since
+        #[arg(long, default_value_t = 0)]
+        train_top: usize,
+        /// Training iterations per model
+        #[arg(long, default_value_t = 150)]
+        iters: usize,
+        /// Seed for trained models (model files are ppo-SYMBOL-SEED.bpk)
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Training data start (YYYY-MM-DD); default is January 1 of the current year
+        #[arg(long)]
+        since: Option<String>,
+        /// Minimum last price for the screen
+        #[arg(long, default_value_t = 5.0)]
+        min_price: f64,
+        /// Minimum average daily dollar volume for the screen
+        #[arg(long, default_value_t = 2_000_000.0)]
+        min_dollar_vol: f64,
+        #[arg(long, default_value = "datasets")]
+        datasets: PathBuf,
+        #[arg(long, default_value = "models")]
+        model_dir: PathBuf,
+    },
+    /// One automated pass: sell losing positions, buy top momentum within the risk gate
+    Auto {
+        #[arg(long, default_value_t = 100)]
+        top: u32,
+        /// How many top momentum candidates may be held long
+        #[arg(long, default_value_t = 5)]
+        long: usize,
+        #[arg(long, default_value_t = 5)]
+        max_positions: usize,
+        /// Per-position cap as a fraction of equity
+        #[arg(long, default_value_t = 0.2)]
+        position_pct: f64,
+        #[arg(long, default_value_t = 5000.0)]
+        max_order: f64,
+        /// Submit paper orders; without this flag the pass is a dry run
+        #[arg(long)]
+        execute: bool,
+        /// Minimum last price for the screen
+        #[arg(long, default_value_t = 5.0)]
+        min_price: f64,
+        /// Minimum average daily dollar volume for the screen
+        #[arg(long, default_value_t = 2_000_000.0)]
+        min_dollar_vol: f64,
+        /// Seconds between passes; 0 runs a single pass
+        #[arg(long, default_value_t = 0)]
+        interval: u64,
+        #[arg(long, default_value = "datasets")]
+        datasets: PathBuf,
+        #[arg(long, default_value = "models")]
+        model_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum DataCmd {
     /// Sync bars from Alpaca into the local Parquet store
     Sync {
@@ -160,6 +232,8 @@ enum DataCmd {
 enum AlpacaCmd {
     /// Show the paper trading account summary
     Account,
+    /// Show open paper positions
+    Positions,
     /// Fetch recent bars straight from the API without storing them
     Bars {
         #[arg(long)]
@@ -179,6 +253,26 @@ fn parse_symbols(raw: &[String]) -> Result<Vec<Symbol>> {
 
 fn creds() -> Result<Credentials> {
     Credentials::from_env().context("set APCA_API_KEY_ID and APCA_API_SECRET to reach Alpaca")
+}
+
+fn print_candidates(header: &str, list: &[paperrl_trade::Candidate], worst_first: bool, limit: usize) {
+    println!("{header}");
+    println!("{:<8} {:>9} {:>8} {:>9} {:>10}", "symbol", "20d", "5d", "score", "last");
+    let iter: Box<dyn Iterator<Item = &paperrl_trade::Candidate>> = if worst_first {
+        Box::new(list.iter().rev())
+    } else {
+        Box::new(list.iter())
+    };
+    for c in iter.take(limit) {
+        println!(
+            "{:<8} {:>8.2}% {:>7.2}% {:>8.2}% {:>10.2}",
+            c.symbol,
+            c.ret20 * 100.0,
+            c.ret5 * 100.0,
+            c.score * 100.0,
+            c.last_close
+        );
+    }
 }
 
 fn print_one(bar: &Bar) {
@@ -218,6 +312,150 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().cmd {
+        Cmd::Trade { cmd } => match cmd {
+            TradeCmd::Scan {
+                top,
+                train_top,
+                iters,
+                seed,
+                since,
+                min_price,
+                min_dollar_vol,
+                datasets,
+                model_dir,
+            } => {
+                anyhow::ensure!((25..=500).contains(&top), "--top must be in [25, 500]");
+                let client = AlpacaClient::new(&creds()?)?;
+                let universe = collect_universe(&client, top).await?;
+                let (bars_by_symbol, skipped, errors) =
+                    ensure_universe_bars(&client, &datasets, &universe, 5).await?;
+                println!(
+                    "universe {} symbols: {} with usable bars, {} skipped, {} errors",
+                    universe.len(),
+                    bars_by_symbol.len(),
+                    skipped.len(),
+                    errors.len()
+                );
+                let ranked = rank_filtered(
+                    bars_by_symbol.iter().map(|(s, b)| (s.as_str(), b.as_slice())),
+                    ScreenFilter { min_price, min_avg_dollar_volume: min_dollar_vol },
+                );
+                print_candidates("gaining momentum:", &ranked, false, 12);
+                print_candidates("losing momentum (worst 10):", &ranked, true, 10);
+
+                if train_top > 0 {
+                    let since_dt = match since.as_deref() {
+                        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")?
+                            .and_hms_opt(0, 0, 0)
+                            .context("bad --since date")?
+                            .and_utc(),
+                        None => NaiveDate::from_ymd_opt(Utc::now().year(), 1, 1)
+                            .expect("valid year")
+                            .and_hms_opt(0, 0, 0)
+                            .expect("valid time")
+                            .and_utc(),
+                    };
+                    println!(
+                        "training PPO on bars since {} for the top {train_top} gainers",
+                        since_dt.date_naive()
+                    );
+                    std::fs::create_dir_all(&model_dir)?;
+                    let mut trained = 0usize;
+                    for c in ranked.iter().filter(|c| c.gainer()).take(train_top) {
+                        let Some((_, all_bars)) =
+                            bars_by_symbol.iter().find(|(s, _)| *s == c.symbol)
+                        else {
+                            continue;
+                        };
+                        let subset: Vec<Bar> =
+                            all_bars.iter().filter(|b| b.timestamp >= since_dt).cloned().collect();
+                        if subset.len() <= 12 {
+                            println!("skip {}: only {} bars this year", c.symbol, subset.len());
+                            continue;
+                        }
+                        let env_cfg = EnvConfig { window: 10, ..EnvConfig::default() };
+                        let ppo_cfg = PpoConfig { iters, seed, ..PpoConfig::default() };
+                        let trained_model =
+                            train_ppo(&subset, env_cfg, ppo_cfg, &c.symbol, "1day");
+                        let path = model_dir.join(format!("ppo-{}-{}.bpk", c.symbol, seed));
+                        trained_model.save(&path)?;
+                        println!(
+                            "{}: {} bars this year -> {}",
+                            c.symbol,
+                            subset.len(),
+                            path.display()
+                        );
+                        trained += 1;
+                    }
+                    println!("trained {trained} models");
+                }
+            }
+            TradeCmd::Auto {
+                top,
+                long,
+                max_positions,
+                position_pct,
+                max_order,
+                execute,
+                min_price,
+                min_dollar_vol,
+                interval,
+                datasets,
+                model_dir,
+            } => {
+                anyhow::ensure!((25..=500).contains(&top), "--top must be in [25, 500]");
+                anyhow::ensure!(
+                    (1..=100).contains(&long),
+                    "--long must be in [1, 100]"
+                );
+                let client = AlpacaClient::new(&creds()?)?;
+                let cfg = AutoConfig {
+                    top,
+                    long_count: long,
+                    limits: RiskLimits {
+                        max_positions,
+                        position_pct,
+                        max_order_notional: max_order,
+                        min_order_notional: 50.0,
+                    },
+                    datasets,
+                    model_dir,
+                    filter: ScreenFilter { min_price, min_avg_dollar_volume: min_dollar_vol },
+                    execute,
+                    stale_days: 5,
+                };
+                loop {
+                    let report = run_once(&client, &cfg).await?;
+                    println!("=== automated pass: universe {} symbols ===", report.universe);
+                    print_candidates("gaining momentum:", &report.gainers, false, 10);
+                    print_candidates("losing momentum:", &report.losers, true, 10);
+                    if report.plan.is_empty() {
+                        println!("plan: no orders (nothing to buy or sell under the risk gate)");
+                    } else {
+                        println!("plan:");
+                        for (side, detail) in &report.plan {
+                            println!("  {:<16} {}", side, detail);
+                        }
+                    }
+                    if cfg.execute {
+                        println!("executed (paper):");
+                        for e in &report.executed {
+                            println!("  {e}");
+                        }
+                    } else {
+                        println!("dry run: pass --execute to submit paper orders");
+                    }
+                    for e in &report.errors {
+                        println!("error: {e}");
+                    }
+                    if interval == 0 {
+                        break;
+                    }
+                    tracing::info!("sleeping {interval}s before the next pass");
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                }
+            }
+        },
         Cmd::Train {
             symbol,
             timeframe,
@@ -325,6 +563,23 @@ async fn main() -> Result<()> {
                 println!("cash             {}", summary.cash.as_deref().unwrap_or("-"));
                 println!("buying power     {}", summary.buying_power.as_deref().unwrap_or("-"));
                 println!("portfolio value  {}", summary.portfolio_value.as_deref().unwrap_or("-"));
+            }
+            AlpacaCmd::Positions => {
+                let positions = AlpacaClient::new(&creds()?)?.positions().await?;
+                if positions.is_empty() {
+                    println!("no open positions");
+                } else {
+                    println!(
+                        "{:<8} {:>10} {:>14} {:>12}",
+                        "symbol", "qty", "market value", "unrealized P/L"
+                    );
+                    for p in positions {
+                        println!(
+                            "{:<8} {:>10.4} {:>14.2} {:>12.2}",
+                            p.symbol, p.qty, p.market_value, p.unrealized_pl
+                        );
+                    }
+                }
             }
             AlpacaCmd::Bars {
                 symbol,

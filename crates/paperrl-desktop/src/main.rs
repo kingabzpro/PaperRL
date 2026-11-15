@@ -22,8 +22,47 @@ enum Page {
     Dashboard,
     Markets,
     Lab,
+    Automation,
     Experiments,
     Settings,
+}
+
+#[allow(non_snake_case)]
+#[component]
+fn Logo() -> Element {
+    rsx! {
+        svg {
+            width: "30",
+            height: "30",
+            view_box: "0 0 32 32",
+            defs {
+                linearGradient {
+                    id: "brand",
+                    x1: "0", y1: "0", x2: "1", y2: "1",
+                    stop { offset: "0%", stop_color: "#4f8cff" }
+                    stop { offset: "100%", stop_color: "#7c5cff" }
+                }
+            }
+            rect { x: "0", y: "0", width: "32", height: "32", rx: "9", fill: "url(#brand)" }
+            rect { x: "7", y: "18", width: "3.5", height: "7", rx: "1", fill: "#eaf0fb", opacity: "0.75" }
+            rect { x: "13", y: "13", width: "3.5", height: "12", rx: "1", fill: "#eaf0fb", opacity: "0.9" }
+            rect { x: "19", y: "8", width: "3.5", height: "17", rx: "1", fill: "#ffffff" }
+            path {
+                d: "M6 21 L14 15 L20 11 L27 6",
+                stroke: "#bfe3ff",
+                stroke_width: "1.6",
+                fill: "none",
+                stroke_linecap: "round"
+            }
+            path {
+                d: "M23.5 6 h4 v4",
+                stroke: "#bfe3ff",
+                stroke_width: "1.6",
+                fill: "none",
+                stroke_linecap: "round"
+            }
+        }
+    }
 }
 
 #[allow(non_snake_case)]
@@ -36,6 +75,7 @@ fn App() -> Element {
         Page::Dashboard => rsx! { DashboardPage { datasets, sel } },
         Page::Markets => rsx! { MarketsPage { datasets, sel } },
         Page::Lab => rsx! { LabPage { datasets, sel } },
+        Page::Automation => rsx! { AutomationPage {} },
         Page::Experiments => rsx! { ExperimentsPage {} },
         Page::Settings => rsx! { SettingsPage {} },
     };
@@ -45,7 +85,7 @@ fn App() -> Element {
         div { class: "app",
             aside { class: "sidebar",
                 div { class: "brand",
-                    div { class: "brand-logo", "P" }
+                    Logo {}
                     div {
                         div { class: "brand-name", "PaperRL" }
                         div { class: "brand-sub", "local research desk" }
@@ -55,6 +95,7 @@ fn App() -> Element {
                     (Page::Dashboard, "▦", "Dashboard"),
                     (Page::Markets, "≋", "Markets"),
                     (Page::Lab, "⚗", "Strategy Lab"),
+                    (Page::Automation, "⇄", "Automation"),
                     (Page::Experiments, "◇", "Experiments"),
                     (Page::Settings, "⚙", "Settings"),
                 ] {
@@ -596,6 +637,187 @@ fn LabPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AutomationView {
+    gainers: Vec<(String, String, String, String)>,
+    losers: Vec<(String, String, String, String)>,
+    plan: Vec<(String, String)>,
+    executed: Vec<String>,
+    errors: Vec<String>,
+    universe: usize,
+}
+
+fn start_pass(
+    execute: bool,
+    view: Signal<Option<AutomationView>>,
+    busy: Signal<bool>,
+    note: Signal<String>,
+) {
+    let mut busy = busy;
+    let mut note = note;
+    let mut view = view;
+    if busy() {
+        return;
+    }
+    busy.set(true);
+        note.set(String::new());
+        spawn(async move {
+            let result = async {
+                let creds =
+                    paperrl_alpaca::Credentials::from_env().map_err(|e| e.to_string())?;
+                let client =
+                    paperrl_alpaca::AlpacaClient::new(&creds).map_err(|e| e.to_string())?;
+                let cfg = paperrl_trade::AutoConfig {
+                    top: 100,
+                    long_count: 3,
+                    limits: paperrl_trade::RiskLimits::default(),
+                    datasets: std::path::PathBuf::from("datasets"),
+                    model_dir: std::path::PathBuf::from("models"),
+                    filter: paperrl_trade::ScreenFilter::default(),
+                    execute,
+                    stale_days: 5,
+                };
+                paperrl_trade::run_once(&client, &cfg)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(report) => {
+                    let row = |c: &paperrl_trade::Candidate| {
+                        (
+                            c.symbol.clone(),
+                            fmt_pct(c.ret20),
+                            fmt_pct(c.ret5),
+                            fmt_pct(c.score),
+                        )
+                    };
+                    view.set(Some(AutomationView {
+                        gainers: report.gainers.iter().take(10).map(row).collect(),
+                        losers: report.losers.iter().rev().take(10).map(row).collect(),
+                        plan: report.plan.clone(),
+                        executed: report.executed.clone(),
+                        errors: report.errors.clone(),
+                        universe: report.universe,
+                    }));
+                    note.set(if execute {
+                        format!("paper pass submitted: {} orders", report.executed.len())
+                    } else {
+                        "dry run complete; nothing submitted".to_string()
+                    });
+                }
+                Err(e) => note.set(format!("error: {e}")),
+            }
+            busy.set(false);
+        });
+    }
+
+
+#[component]
+fn AutomationPage() -> Element {
+    let view = use_signal(|| None::<AutomationView>);
+    let busy = use_signal(|| false);
+    let note = use_signal(String::new);
+
+    rsx! {
+        div { class: "page-head",
+            div {
+                div { class: "page-title", "Automation" }
+                div { class: "page-sub",
+                    "momentum screen over the top 100 most active symbols; sells losers, buys leaders through the risk gate"
+                }
+            }
+            div { class: "head-actions",
+                button {
+                    class: "ghost",
+                    disabled: busy(),
+                    onclick: move |_| start_pass(false, view, busy, note),
+                    if busy() { "Scanning..." } else { "Scan (dry run)" }
+                }
+                button {
+                    disabled: busy(),
+                    onclick: move |_| start_pass(true, view, busy, note),
+                    "Execute paper pass"
+                }
+            }
+        }
+        div { class: "card",
+            div { class: "muted-note",
+                "Orders go to your Alpaca PAPER account only. The risk gate caps positions, per-order size, and cash; orders in flight block duplicate buys. Every submission is appended to logs/orders.csv."
+            }
+            if !note().is_empty() {
+                div { class: "muted-note", style: "margin-top: 8px;", "{note}" }
+            }
+        }
+        if let Some(v) = view.read().clone() {
+            div { class: "card",
+                div { class: "card-title", "Universe: {v.universe} symbols screened" }
+                div { class: "split",
+                    div {
+                        div { class: "card-title", "Gaining momentum" }
+                        table {
+                            thead { tr { th { "Symbol" } th { "20d" } th { "5d" } th { "Score" } } }
+                            tbody {
+                                for (sym, r20, r5, score) in v.gainers {
+                                    tr {
+                                        td { span { class: "strategy-name", "{sym}" } }
+                                        td { class: "pos", "{r20}" }
+                                        td { class: "pos", "{r5}" }
+                                        td { "{score}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div {
+                        div { class: "card-title", "Losing momentum" }
+                        table {
+                            thead { tr { th { "Symbol" } th { "20d" } th { "5d" } th { "Score" } } }
+                            tbody {
+                                for (sym, r20, r5, score) in v.losers {
+                                    tr {
+                                        td { span { class: "strategy-name", "{sym}" } }
+                                        td { class: "neg", "{r20}" }
+                                        td { "{r5}" }
+                                        td { "{score}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "card",
+                div { class: "card-title", "Planned orders" }
+                if v.plan.is_empty() {
+                    div { class: "muted-note", "No orders: nothing qualifies or everything is already positioned or pending." }
+                } else {
+                    table {
+                        thead { tr { th { "Order" } th { "Size" } } }
+                        tbody {
+                            for (side, detail) in v.plan {
+                                tr {
+                                    td { span { class: "strategy-name", "{side}" } }
+                                    td { "{detail}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !v.executed.is_empty() {
+                    div { class: "card-title", style: "margin-top: 14px;", "Submitted" }
+                    for e in v.executed {
+                        div { class: "muted-note", "{e}" }
+                    }
+                }
+                for e in v.errors {
+                    div { class: "error-box", "{e}" }
                 }
             }
         }

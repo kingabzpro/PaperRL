@@ -18,6 +18,7 @@ paperrl-data = { workspace = true }
 paperrl-sim = { workspace = true }
 paperrl-alpaca = { workspace = true }
 paperrl-rl = { workspace = true }
+paperrl-trade = { workspace = true }
 dioxus = { version = "0.7", features = ["desktop"] }
 chrono = { workspace = true }
 serde_json = { workspace = true }
