@@ -151,6 +151,16 @@ Orders carry client order IDs that start with `paperrl-`. Stop cancels open orde
 
 The risk gate caps position count, position size, per-order notional and total spend by available cash. It never uses leverage, and symbols with open orders count as held, so a repeated pass cannot duplicate a buy.
 
+## Verified behavior
+
+Checks run on 2026-11-15 against an Alpaca paper account, with the equity market closed:
+
+- Signals analyzed `AAPL, BTC/USD, BADTICKER` and returned Buy at 97% confidence for AAPL, Sell at 91% for BTC/USD through the crypto path, and an inline error for the bad ticker.
+- A bot started at a 60-second interval wrote three pass entries, all marked `skipped: market closed`, and Stop returned the state to idle.
+- With EUR as the base currency and the free plan returning HTTP 403 for FX rates, the app fell back to USD display with a visible note.
+- The portable executable launched from a directory with no data and created `%USERPROFILE%\paperrl` on first run.
+- A CLI scan over 190 symbols trained three models. The first automated pass submitted three $2,000 paper buys (all Accepted), buying power fell by $6,000, and an immediate second pass planned zero orders.
+
 ## Known limits
 
 - Leveraged single-stock ETFs such as TSLL and TSLG pass the price and volume filters and can dominate momentum rankings. There is no exclusion list yet, so do not treat paper results as investment evidence.
