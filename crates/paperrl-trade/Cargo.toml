@@ -12,6 +12,7 @@ paperrl-sim = { workspace = true }
 paperrl-rl = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 

@@ -88,7 +88,8 @@ impl Symbol {
     }
 }
 
-const CURRENCIES: &[(&str, &str)] = &[
+/// The currencies the app can display, as (code, symbol) pairs.
+pub const CURRENCIES: &[(&str, &str)] = &[
     ("USD", "$"),
     ("EUR", "\u{20ac}"),
     ("GBP", "\u{a3}"),

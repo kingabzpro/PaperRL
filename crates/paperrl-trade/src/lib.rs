@@ -673,7 +673,7 @@ pub fn read_pass_history(home: &Path) -> Vec<PassEntry> {
 
 /// The strategy weight the symbol's newest checkpoint would take on the
 /// latest close, or None when no checkpoint exists or it cannot be loaded.
-fn latest_model_weight(model_dir: &Path, symbol: &str, bars: &[Bar]) -> Option<ModelProvenance> {
+pub fn latest_model_weight(model_dir: &Path, symbol: &str, bars: &[Bar]) -> Option<ModelProvenance> {
     let slug = Symbol::parse(symbol)
         .map(|s| s.file_slug())
         .unwrap_or_else(|_| symbol.to_string());
@@ -791,16 +791,17 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
 
     // 4. Account and positions.
     let account = client.account().await?;
-    let equity: f64 = account
-        .equity
-        .as_deref()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-    let cash: f64 = account
-        .cash
-        .as_deref()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
+    let parse_amount = |field: &str, value: &Option<String>| -> f64 {
+        match value.as_deref().and_then(|v| v.parse().ok()) {
+            Some(x) => x,
+            None => {
+                tracing::warn!("account: unreadable {field}");
+                0.0
+            }
+        }
+    };
+    let equity: f64 = parse_amount("equity", &account.equity);
+    let cash: f64 = parse_amount("cash", &account.cash);
     let positions = client.positions().await?;
     let held: Vec<(String, f64)> =
         positions.iter().map(|p| (p.symbol.clone(), p.qty)).collect();
@@ -1272,7 +1273,7 @@ mod tests {
     fn universe_override_skips_screener() {
         // The override path guarantees only watchlist bars reach the ranker;
         // pin that candidates outside the supplied bars can never be planned.
-        let bars = vec![
+        let bars = [
             ("AAPL".to_string(), rising(120)),
             ("MSFT".to_string(), falling(120)),
         ];
@@ -1330,7 +1331,7 @@ mod tests {
         for b in penny.iter_mut() {
             b.volume = 300_000.0; // $150k ADV and a sub-$5 price
         }
-        let items = vec![("FLAT", flat.as_slice()), ("PENNY", penny.as_slice())];
+        let items = [("FLAT", flat.as_slice()), ("PENNY", penny.as_slice())];
         let filtered = rank_filtered(items.iter().copied(), ScreenFilter::default());
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].symbol, "FLAT");
@@ -1341,7 +1342,7 @@ mod tests {
         for b in thin.iter_mut() {
             b.volume = 10.0; // $100/day
         }
-        let items2 = vec![("THIN", thin.as_slice())];
+        let items2 = [("THIN", thin.as_slice())];
         assert!(rank_filtered(items2.iter().copied(), ScreenFilter::default()).is_empty());
     }
 

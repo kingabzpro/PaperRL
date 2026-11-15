@@ -23,7 +23,62 @@ fn app_icon() -> dioxus::desktop::tao::window::Icon {
     .expect("valid icon data")
 }
 
+/// Writes every log record to the append-only file behind the mutex.
+struct FileMakeWriter(std::sync::Mutex<std::fs::File>);
+
+struct FileGuard<'a>(&'a std::sync::Mutex<std::fs::File>);
+
+impl std::io::Write for FileGuard<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log file lock").write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().expect("log file lock").flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileMakeWriter {
+    type Writer = FileGuard<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        FileGuard(&self.0)
+    }
+}
+
+/// Console and `<home>/logs/app.log` logging; RUST_LOG picks the level.
+fn init_logging() {
+    use tracing_subscriber::prelude::*;
+    let logs = home().join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join("app.log"));
+    let file_layer = file.ok().map(|f| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(FileMakeWriter(std::sync::Mutex::new(f)))
+    });
+    match file_layer {
+        Some(file_layer) => {
+            tracing_subscriber::registry()
+                .with(filter.clone())
+                .with(tracing_subscriber::fmt::layer())
+                .with(file_layer)
+                .init();
+        }
+        None => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+        }
+    }
+}
+
 fn main() {
+    init_logging();
     // PAPERRL_START_PAGE lets screenshots and demos open a specific page.
     // Retry once with a clear message: on Windows, WebView2 cannot create
     // its composition controller while the session is locked or the desktop
@@ -1278,6 +1333,24 @@ fn MarketsPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element {
     }
 }
 
+/// Parses and validates Lab inputs; the simulator asserts on nonsense
+/// numbers, so bad values surface as messages instead.
+fn sim_params_from(cash: String, fee: String, slip: String) -> Result<SimParams, String> {
+    let cash: f64 = cash.trim().parse().map_err(|_| "cash must be a number".to_string())?;
+    let fee_bps: f64 = fee.trim().parse().map_err(|_| "fee bps must be a number".to_string())?;
+    let slippage_bps: f64 = slip.trim().parse().map_err(|_| "slippage bps must be a number".to_string())?;
+    if !cash.is_finite() || cash <= 0.0 {
+        return Err("cash must be a positive number".into());
+    }
+    if !fee_bps.is_finite() || fee_bps < 0.0 || fee_bps > 1000.0 {
+        return Err("fee bps must be between 0 and 1000".into());
+    }
+    if !slippage_bps.is_finite() || slippage_bps < 0.0 || slippage_bps > 1000.0 {
+        return Err("slippage bps must be between 0 and 1000".into());
+    }
+    Ok(SimParams { cash, fee_bps, slippage_bps })
+}
+
 #[component]
 fn LabPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element {
     let mut cash = use_signal(|| "100000".to_string());
@@ -1293,10 +1366,12 @@ fn LabPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element {
             message.set("Select a dataset in Markets first.".into());
             return;
         };
-        let params = SimParams {
-            cash: cash().parse().unwrap_or(100_000.0),
-            fee_bps: fee().parse().unwrap_or(1.0),
-            slippage_bps: slip().parse().unwrap_or(5.0),
+        let params = match sim_params_from(cash(), fee(), slip()) {
+            Ok(p) => p,
+            Err(e) => {
+                message.set(format!("⚠ {e}"));
+                return;
+            }
         };
         let bars = bars_for(&datasets, &sel);
         let model = ppo_model_for(&ds.symbol);
@@ -1309,10 +1384,12 @@ fn LabPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element {
             message.set("Select a dataset in Markets first.".into());
             return;
         };
-        let params = SimParams {
-            cash: cash().parse().unwrap_or(100_000.0),
-            fee_bps: fee().parse().unwrap_or(1.0),
-            slippage_bps: slip().parse().unwrap_or(5.0),
+        let params = match sim_params_from(cash(), fee(), slip()) {
+            Ok(p) => p,
+            Err(e) => {
+                message.set(format!("⚠ {e}"));
+                return;
+            }
         };
         let m: u32 = months().parse().unwrap_or(6).max(1);
         let bars = bars_for(&datasets, &sel);
