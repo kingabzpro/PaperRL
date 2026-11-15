@@ -51,7 +51,26 @@ enum Page {
 #[component]
 fn Logo() -> Element {
     rsx! {
-        div { class: "brand-logo", "📊" }
+        svg {
+            width: "32",
+            height: "32",
+            view_box: "0 0 64 64",
+            rect { width: "64", height: "64", rx: "16", fill: "#101C2C" }
+            path { d: "M18 12h19l11 11v29H18z", fill: "#EAF2F7" }
+            path { d: "M37 12v12h11", fill: "#C8D9E5" }
+            path {
+                d: "M24 42l8-9 7 4 8-11",
+                fill: "none",
+                stroke: "#08B98B",
+                stroke_width: "3.2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round"
+            }
+            circle { cx: "24", cy: "42", r: "2.5", fill: "#08B98B" }
+            circle { cx: "32", cy: "33", r: "2.5", fill: "#08B98B" }
+            circle { cx: "39", cy: "37", r: "2.5", fill: "#08B98B" }
+            circle { cx: "47", cy: "26", r: "3", fill: "#F5B94C" }
+        }
     }
 }
 
@@ -337,11 +356,11 @@ fn CandleChart(bars: Vec<paperrl_core::Bar>) -> Element {
                 style: "display: block;",
                 line {
                     x1: "0", y1: "{geom.price_bottom:.1}", x2: "900", y2: "{geom.price_bottom:.1}",
-                    stroke: "#1e2a44", stroke_width: "1", stroke_dasharray: "3 4"
+                    stroke: "#22334A", stroke_width: "1", stroke_dasharray: "3 4"
                 }
                 line {
                     x1: "0", y1: "{geom.volume_top:.1}", x2: "900", y2: "{geom.volume_top:.1}",
-                    stroke: "#1e2a44", stroke_width: "1", stroke_dasharray: "3 4"
+                    stroke: "#22334A", stroke_width: "1", stroke_dasharray: "3 4"
                 }
                 for (i, c) in geom.candles.iter().enumerate() {
                     g {
@@ -891,7 +910,7 @@ fn ExperimentsPage() -> Element {
                             polyline {
                                 points: "{pts}",
                                 fill: "none",
-                                stroke: "#4f8cff",
+                                stroke: "#08B98B",
                                 stroke_width: "2"
                             }
                         }
