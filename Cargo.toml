@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/paperrl-core",
+    "crates/paperrl-alpaca",
+    "crates/paperrl-data",
+    "crates/paperrl-sim",
+    "crates/paperrl-rl",
+    "crates/paperrl-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+paperrl-core = { path = "crates/paperrl-core" }
+paperrl-alpaca = { path = "crates/paperrl-alpaca" }
+paperrl-data = { path = "crates/paperrl-data" }
+paperrl-sim = { path = "crates/paperrl-sim" }
+paperrl-rl = { path = "crates/paperrl-rl" }
+# Pre-1.0 SDK: pinned exactly and isolated behind paperrl-alpaca.
+alpacars = "=0.8.0"
+anyhow = "1"
+arrow = "60"
+# RL stack: PPO written directly on Burn (decision: skip rl4burn, it pins Burn 0.20).
+# flex = pure-Rust CPU backend; ndarray is deprecated in 0.22.
+burn = { version = "=0.22.1", features = ["flex"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+parquet = "60"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

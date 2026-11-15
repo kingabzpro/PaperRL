@@ -1,0 +1,22 @@
+[package]
+name = "paperrl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "paperrl"
+path = "src/main.rs"
+
+[dependencies]
+paperrl-core = { workspace = true }
+paperrl-alpaca = { workspace = true }
+paperrl-data = { workspace = true }
+paperrl-sim = { workspace = true }
+paperrl-rl = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
