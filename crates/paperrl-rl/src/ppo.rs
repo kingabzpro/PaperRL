@@ -25,9 +25,9 @@ fn train_device() -> Device {
     Device::flex().autodiff()
 }
 
-/// Target equity weight for each discrete action index (0% exit / 25% small /
-/// 50% medium / 100% full, from the PaperRL action design).
-pub const ACTION_WEIGHTS: [f64; 4] = [0.0, 0.25, 0.5, 1.0];
+/// Target equity weight for each discrete action index (0/25/50/75/100%
+/// allocation levels, per the five-action PaperRL design).
+pub const ACTION_WEIGHTS: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 
 /// PPO hyperparameters; doubles as reproducibility metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -147,7 +147,7 @@ impl TrainedPpo {
         .map_err(|e| paperrl_core::Error::Other(format!("{}: {e}", meta_path.display())))?;
         let device = Device::flex();
         let net = PpoNet::new(
-            meta.window + 4,
+            meta.window + 6,
             ACTION_WEIGHTS.len(),
             meta.config.hidden,
             &device,
@@ -254,7 +254,7 @@ pub fn train_ppo(
     let device = train_device();
     // Seeds network initialization (flex stores a global RNG for inits).
     device.seed(config.seed);
-    let obs_len = env_cfg.window + 4;
+    let obs_len = env_cfg.window + 6;
     let n_actions = ACTION_WEIGHTS.len();
     let mut net = PpoNet::new(obs_len, n_actions, config.hidden, &device);
     let mut opt = AdamConfig::new().init();
@@ -417,11 +417,21 @@ impl paperrl_sim::Strategy for PpoStrategy {
     }
 
     fn on_close(&mut self, bar: &Bar, position_weight: f64, drawdown: f64) -> f64 {
-        let Some((returns, vol, volume_ratio)) = self.rolling.push(bar) else {
+        let Some(f) = self.rolling.push(bar) else {
             // Warmup: not enough history for the observation yet.
             return 0.0;
         };
-        let obs = obs_vector(&returns, &[position_weight, drawdown, vol, volume_ratio]);
+        let obs = obs_vector(
+            &f.returns,
+            &[
+                position_weight,
+                drawdown,
+                f.volatility,
+                f.volume_ratio,
+                f.macd_norm,
+                f.rsi_norm,
+            ],
+        );
         let k = obs.len();
         let t = Tensor::<2>::from_data(TensorData::new(obs, vec![1, k]), &self.device);
         let (logits, _) = self.net.forward(t);
@@ -458,7 +468,7 @@ mod tests {
 
     #[test]
     fn action_weights_match_the_spec() {
-        assert_eq!(ACTION_WEIGHTS, [0.0, 0.25, 0.5, 1.0]);
+        assert_eq!(ACTION_WEIGHTS, [0.0, 0.25, 0.5, 0.75, 1.0]);
     }
 
     #[test]
@@ -578,4 +588,5 @@ mod tests {
         assert_eq!(meta.symbol, "TEST");
     }
 }
+
 

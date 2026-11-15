@@ -9,7 +9,9 @@ use paperrl_alpaca::{AlpacaClient, Credentials};
 use paperrl_core::{Bar, Symbol, Timeframe};
 use paperrl_data::BarStore;
 use paperrl_rl::{EnvConfig, PpoConfig, PpoStrategy, train_ppo};
-use paperrl_sim::{BuyHold, EmaCross, SimConfig, Strategy};
+use paperrl_sim::{
+    BuyHold, EmaCross, MeanReversion, Momentum, SimConfig, Strategy, VolTarget,
+};
 
 #[derive(Parser)]
 #[command(name = "paperrl", version, about = "Local-first RL trading research platform")]
@@ -104,6 +106,15 @@ enum Strat {
     /// Enter when the fast EMA is above the slow one, exit below
     #[value(name = "ema")]
     Ema,
+    /// Long while the trailing --fast-bar return is positive
+    #[value(name = "momentum")]
+    Momentum,
+    /// Long when the close is below its --fast-bar SMA
+    #[value(name = "meanrev")]
+    MeanRev,
+    /// Long with weight scaled to a 15% annualized volatility target
+    #[value(name = "voltarget")]
+    VolTarget,
     /// A trained PPO policy (requires --model)
     #[value(name = "ppo")]
     Ppo,
@@ -414,6 +425,9 @@ async fn main() -> Result<()> {
                 Ok(match s {
                     Strat::BuyHold => Box::new(BuyHold),
                     Strat::Ema => Box::new(EmaCross::new(fast, slow)),
+                    Strat::Momentum => Box::new(Momentum::new(fast)),
+                    Strat::MeanRev => Box::new(MeanReversion::new(fast)),
+                    Strat::VolTarget => Box::new(VolTarget::new(fast, 0.15)),
                     Strat::Ppo => Box::new(ppo.as_ref().context(
                         "--model is required for the ppo strategy",
                     )?.clone()),
@@ -473,6 +487,9 @@ async fn main() -> Result<()> {
                             &mut || match other {
                                 Strat::BuyHold => Box::new(BuyHold),
                                 Strat::Ema => Box::new(EmaCross::new(fast, slow)),
+                                Strat::Momentum => Box::new(Momentum::new(fast)),
+                                Strat::MeanRev => Box::new(MeanReversion::new(fast)),
+                                Strat::VolTarget => Box::new(VolTarget::new(fast, 0.15)),
                                 Strat::Ppo => unreachable!("handled by the ppo arm"),
                             },
                             &cfg,
@@ -488,19 +505,21 @@ async fn main() -> Result<()> {
                 bars.len()
             );
             println!(
-                "{:<10} {:>10} {:>8} {:>9} {:>8} {:>7} {:>14} {:>10}",
-                "strategy", "net ret", "sharpe", "max dd", "win", "trades", "turnover $", "fees $"
+                "{:<10} {:>10} {:>8} {:>9} {:>8} {:>7} {:>7} {:>14} {:>10}",
+                "strategy", "net ret", "sharpe", "max dd", "win", "exp", "trades", "turnover $",
+                "fees $"
             );
             for s in &strategies {
                 let mut strat: Box<dyn Strategy> = build(s)?;
                 let m = paperrl_sim::run(&bars, strat.as_mut(), &cfg).metrics;
                 println!(
-                    "{:<10} {:>9.2}% {:>8.2} {:>8.2}% {:>7.1}% {:>7} {:>14.0} {:>10.2}",
+                    "{:<10} {:>9.2}% {:>8.2} {:>8.2}% {:>7.1}% {:>6.1}% {:>7} {:>14.0} {:>10.2}",
                     strat.name(),
                     m.net_return * 100.0,
                     m.sharpe,
                     m.max_drawdown * 100.0,
                     m.win_rate * 100.0,
+                    m.avg_exposure * 100.0,
                     m.trades,
                     m.turnover,
                     m.total_fees

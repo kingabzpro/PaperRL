@@ -98,6 +98,116 @@ impl Strategy for EmaCross {
     }
 }
 
+/// Time-series momentum: long while the trailing `window`-bar return is positive.
+pub struct Momentum {
+    window: usize,
+    closes: std::collections::VecDeque<f64>,
+}
+
+impl Momentum {
+    pub fn new(window: usize) -> Self {
+        assert!(window > 0, "window must be positive");
+        Self { window, closes: std::collections::VecDeque::new() }
+    }
+}
+
+impl Strategy for Momentum {
+    fn name(&self) -> &str {
+        "momentum"
+    }
+    fn on_close(&mut self, bar: &Bar, _position_weight: f64, _drawdown: f64) -> f64 {
+        self.closes.push_back(bar.close);
+        if self.closes.len() > self.window + 1 {
+            self.closes.pop_front();
+        }
+        if self.closes.len() < self.window + 1 {
+            return 0.0;
+        }
+        if bar.close > self.closes[0] {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Mean reversion: long when the close is below its `window`-bar SMA.
+pub struct MeanReversion {
+    window: usize,
+    closes: std::collections::VecDeque<f64>,
+}
+
+impl MeanReversion {
+    pub fn new(window: usize) -> Self {
+        assert!(window > 0, "window must be positive");
+        Self { window, closes: std::collections::VecDeque::new() }
+    }
+}
+
+impl Strategy for MeanReversion {
+    fn name(&self) -> &str {
+        "meanrev"
+    }
+    fn on_close(&mut self, bar: &Bar, _position_weight: f64, _drawdown: f64) -> f64 {
+        self.closes.push_back(bar.close);
+        if self.closes.len() > self.window {
+            self.closes.pop_front();
+        }
+        if self.closes.len() < self.window {
+            return 0.0;
+        }
+        let sma = self.closes.iter().sum::<f64>() / self.closes.len() as f64;
+        if bar.close < sma {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Volatility targeting: weight = min(1, target_vol / realized_vol), long only.
+pub struct VolTarget {
+    window: usize,
+    target_vol: f64,
+    closes: std::collections::VecDeque<f64>,
+}
+
+impl VolTarget {
+    /// `target_vol` is annualized (0.15 = 15%).
+    pub fn new(window: usize, target_vol: f64) -> Self {
+        assert!(window > 1 && target_vol > 0.0, "need window > 1 and target_vol > 0");
+        Self { window, target_vol, closes: std::collections::VecDeque::new() }
+    }
+}
+
+impl Strategy for VolTarget {
+    fn name(&self) -> &str {
+        "voltarget"
+    }
+    fn on_close(&mut self, bar: &Bar, _position_weight: f64, _drawdown: f64) -> f64 {
+        self.closes.push_back(bar.close);
+        if self.closes.len() > self.window + 1 {
+            self.closes.pop_front();
+        }
+        if self.closes.len() < self.window + 1 {
+            return 0.0;
+        }
+        let closes: Vec<f64> = self.closes.iter().copied().collect();
+        let returns: Vec<f64> = closes
+            .windows(2)
+            .map(|w| w[1] / w[0] - 1.0)
+            .collect();
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let ann_vol = var.sqrt() * 252f64.sqrt();
+        if ann_vol < 1e-9 {
+            return 1.0;
+        }
+        (self.target_vol / ann_vol).clamp(0.0, 1.0)
+    }
+}
+
 /// Performance metrics for one simulated run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Metrics {
@@ -115,6 +225,8 @@ pub struct Metrics {
     /// Absolute traded notional in USD.
     pub turnover: f64,
     pub total_fees: f64,
+    /// Mean position weight over the bars (exposure, not leverage).
+    pub avg_exposure: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +350,7 @@ pub fn run(bars: &[Bar], strategy: &mut dyn Strategy, cfg: &SimConfig) -> SimRes
                 trades: 0,
                 turnover: 0.0,
                 total_fees: 0.0,
+                avg_exposure: 0.0,
             },
         };
     }
@@ -245,12 +358,14 @@ pub fn run(bars: &[Bar], strategy: &mut dyn Strategy, cfg: &SimConfig) -> SimRes
     let mut pf = Portfolio::new(cfg.initial_cash, cfg.fee_bps, cfg.slippage_bps);
     let mut equity = Vec::with_capacity(bars.len());
     let mut peak = cfg.initial_cash;
+    let mut exposure_sum = 0.0;
     for bar in bars {
         pf.fill_at_open(bar);
         let eq = pf.equity(bar.close);
         equity.push(eq);
         peak = peak.max(eq);
         let pw = pf.position_weight(bar.close);
+        exposure_sum += pw;
         let dd = (1.0 - eq / peak).max(0.0);
         pf.on_close(strategy.on_close(bar, pw, dd));
     }
@@ -294,6 +409,7 @@ pub fn run(bars: &[Bar], strategy: &mut dyn Strategy, cfg: &SimConfig) -> SimRes
             trades: pf.trades,
             turnover: pf.turnover,
             total_fees: pf.total_fees,
+            avg_exposure: exposure_sum / bars.len() as f64,
         },
     }
 }
@@ -497,6 +613,8 @@ mod tests {
         let cost = shares * 100.0;
         approx(res.metrics.total_fees, cost * 0.001);
         approx(res.metrics.turnover, cost);
+        // Flat at the first close, fully invested after: 2 of 3 bars.
+        approx(res.metrics.avg_exposure, 2.0 / 3.0);
         approx(res.metrics.max_drawdown, 0.0);
         approx(res.metrics.net_return, shares * 102.0 / 10_000.0 - 1.0);
     }
@@ -690,6 +808,54 @@ mod tests {
     fn walk_forward_rejects_zero_window() {
         let bs = vec![bar_at(ts(2024, 1, 15), 10.0, 10.0)];
         let _ = walk_forward(&bs, &mut || Box::new(BuyHold), &cfg(10_000.0, 0.0, 0.0), 0);
+    }
+
+    #[test]
+    fn momentum_follows_trend_sign() {
+        let mut up = Momentum::new(3);
+        let rising: Vec<Bar> = (0..6).map(|i| bar_at(ts(2024, 1, 1 + i), 10.0 + i as f64, 10.0 + i as f64)).collect();
+        let mut last = 0.0;
+        for b in &rising {
+            last = up.on_close(b, 0.0, 0.0);
+        }
+        approx(last, 1.0);
+
+        let mut down = Momentum::new(3);
+        let falling: Vec<Bar> = (0..6).map(|i| bar_at(ts(2024, 1, 1 + i), 20.0 - i as f64, 20.0 - i as f64)).collect();
+        for b in &falling {
+            last = down.on_close(b, 0.0, 0.0);
+        }
+        approx(last, 0.0);
+    }
+
+    #[test]
+    fn mean_reversion_buys_below_sma() {
+        let mut mr = MeanReversion::new(3);
+        let mut last = 0.0;
+        for c in [10.0, 10.0, 10.0, 8.0] {
+            last = mr.on_close(&bar_at(ts(2024, 1, 1), 10.0, c), 0.0, 0.0);
+        }
+        approx(last, 1.0);
+        last = mr.on_close(&bar_at(ts(2024, 1, 2), 10.0, 12.0), 0.0, 0.0);
+        approx(last, 0.0);
+    }
+
+    #[test]
+    fn vol_target_scales_with_realized_volatility() {
+        // Alternating +2% / -2% moves -> annualized vol well above 15%, so the
+        // weight must be scaled down below 1.
+        let mut vt = VolTarget::new(4, 0.15);
+        let mut last = 0.0;
+        for (i, c) in [100.0, 102.0, 100.0, 102.0, 100.0, 102.0].iter().enumerate() {
+            last = vt.on_close(&bar_at(ts(2024, 1, 1 + i as u32), *c, *c), 0.0, 0.0);
+        }
+        assert!(last > 0.0 && last < 1.0, "got {last}");
+        // Flat prices -> zero vol -> fully invested.
+        let mut flat = VolTarget::new(4, 0.15);
+        for i in 0..6 {
+            last = flat.on_close(&bar_at(ts(2024, 1, 1 + i as u32), 10.0, 10.0), 0.0, 0.0);
+        }
+        approx(last, 1.0);
     }
 
     #[test]

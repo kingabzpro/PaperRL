@@ -9,7 +9,11 @@
 use paperrl_core::Bar;
 use paperrl_sim::Portfolio;
 
+mod features;
 mod ppo;
+pub use features::{
+    Ema, ObsFeatures, RollingObs, Rsi, obs_vector, volatility, volume_ratio,
+};
 pub use ppo::{
     ACTION_WEIGHTS, ModelMeta, PpoConfig, PpoNet, PpoStrategy, TrainedPpo, compute_gae, train_ppo,
 };
@@ -23,6 +27,9 @@ pub struct EnvConfig {
     /// Drawdown level where the penalty starts (ordinary fluctuations are free).
     #[serde(default = "default_dd_threshold")]
     pub dd_threshold: f64,
+    /// Penalty per unit of position weight times rolling volatility (lambda_v).
+    #[serde(default = "default_vol_penalty")]
+    pub vol_penalty: f64,
     /// Penalty per unit of traded notional over equity (lambda_u).
     pub turnover_penalty: f64,
     pub initial_cash: f64,
@@ -32,6 +39,10 @@ pub struct EnvConfig {
 
 fn default_dd_threshold() -> f64 {
     0.10
+}
+
+fn default_vol_penalty() -> f64 {
+    0.01
 }
 
 impl Default for EnvConfig {
@@ -45,6 +56,7 @@ impl Default for EnvConfig {
             // 1.0 makes "never invest" the optimal policy.
             dd_penalty: 0.5,
             dd_threshold: 0.15,
+            vol_penalty: 0.01,
             turnover_penalty: 0.005,
             initial_cash: 100_000.0,
             fee_bps: 1.0,
@@ -60,78 +72,6 @@ pub struct Step {
     pub done: bool,
 }
 
-/// Builds the observation vector shared by the training environment and live
-/// strategies, so both always see the same layout: `returns` oldest first,
-/// then the feature vector (position weight, drawdown, volatility, volume ratio).
-pub fn obs_vector(returns: &[f64], features: &[f64]) -> Vec<f32> {
-    let mut obs = Vec::with_capacity(returns.len() + features.len());
-    obs.extend(returns.iter().map(|r| *r as f32));
-    obs.extend(features.iter().map(|f| *f as f32));
-    obs
-}
-
-/// Population standard deviation of the returns (0 for fewer than 2 values).
-pub fn volatility(returns: &[f64]) -> f64 {
-    if returns.len() < 2 {
-        return 0.0;
-    }
-    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-    (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64).sqrt()
-}
-
-/// Current volume over the mean of the prior `history` volumes.
-pub fn volume_ratio(history: &[f64], current: f64) -> f64 {
-    if history.is_empty() {
-        return 1.0;
-    }
-    let mean = history.iter().sum::<f64>() / history.len() as f64;
-    current / mean.max(1e-12)
-}
-
-/// Rolling per-bar observation inputs for streaming strategies. Feeding the
-/// same bars as the training environment produces the same returns,
-/// volatility, and volume ratio by construction (shared helpers above).
-#[derive(Clone)]
-pub struct RollingObs {
-    window: usize,
-    prev_close: Option<f64>,
-    returns: Vec<f64>,
-    volumes: Vec<f64>,
-}
-
-impl RollingObs {
-    pub fn new(window: usize) -> Self {
-        Self { window, prev_close: None, returns: Vec::new(), volumes: Vec::new() }
-    }
-
-    /// Pushes one bar; once `window` returns and `window` prior volumes exist,
-    /// returns `(returns, volatility, volume_ratio)`.
-    pub fn push(&mut self, bar: &Bar) -> Option<(Vec<f64>, f64, f64)> {
-        let volume_ratio = if self.volumes.len() == self.window {
-            Some(volume_ratio(&self.volumes, bar.volume))
-        } else {
-            None
-        };
-        if let Some(prev) = self.prev_close {
-            self.returns.push(bar.close / prev - 1.0);
-        }
-        self.prev_close = Some(bar.close);
-        self.volumes.push(bar.volume);
-        if self.volumes.len() > self.window {
-            self.volumes.remove(0);
-        }
-        if self.returns.len() > self.window {
-            self.returns.remove(0);
-        }
-        let vr = volume_ratio?;
-        if self.returns.len() < self.window {
-            return None;
-        }
-        let vol = volatility(&self.returns);
-        Some((self.returns.clone(), vol, vr))
-    }
-}
-
 /// Single-symbol trading environment over a stored bar slice.
 pub struct TradingEnv<'a> {
     bars: &'a [Bar],
@@ -143,6 +83,8 @@ pub struct TradingEnv<'a> {
     prev_excess_dd: f64,
     prev_equity: f64,
     prev_turnover: f64,
+    rolling: RollingObs,
+    features: ObsFeatures,
 }
 
 impl<'a> TradingEnv<'a> {
@@ -151,6 +93,11 @@ impl<'a> TradingEnv<'a> {
             bars.len() > cfg.window + 1,
             "need at least one steppable bar beyond the observation window"
         );
+        let mut rolling = RollingObs::new(cfg.window);
+        let mut features = None;
+        for bar in bars.iter().take(cfg.window + 1) {
+            features = rolling.push(bar).or(features);
+        }
         Self {
             bars,
             cfg,
@@ -160,32 +107,31 @@ impl<'a> TradingEnv<'a> {
             prev_excess_dd: 0.0,
             prev_equity: cfg.initial_cash,
             prev_turnover: 0.0,
+            rolling,
+            features: features.expect("window warmed during construction"),
         }
     }
 
-    /// Length of the observation vector: `window` returns + 4 features
-    /// (position weight, drawdown, volatility, volume ratio).
+    /// Length of the observation vector: `window` returns + 6 features
+    /// (weight, drawdown, volatility, volume ratio, MACD histogram, RSI).
     pub fn obs_len(&self) -> usize {
-        self.cfg.window + 4
+        self.cfg.window + 6
     }
 
-    /// Features as of the current close: `window` close-to-close returns, then
-    /// position weight, drawdown, volatility, and volume ratio.
+    /// Features as of the current close: `window` returns, weight, drawdown,
+    /// volatility, volume ratio, MACD histogram, and RSI.
     pub fn obs(&self) -> Vec<f32> {
         let i = self.i;
-        let returns: Vec<f64> = ((i - self.cfg.window + 1)..=i)
-            .map(|k| self.bars[k].close / self.bars[k - 1].close - 1.0)
-            .collect();
-        let history: Vec<f64> =
-            ((i - self.cfg.window)..i).map(|k| self.bars[k].volume).collect();
         let eq = self.pf.equity(self.bars[i].close);
         let features = [
             self.pf.position_weight(self.bars[i].close),
             (1.0 - eq / self.peak).max(0.0),
-            volatility(&returns),
-            volume_ratio(&history, self.bars[i].volume),
+            self.features.volatility,
+            self.features.volume_ratio,
+            self.features.macd_norm,
+            self.features.rsi_norm,
         ];
-        obs_vector(&returns, &features)
+        obs_vector(&self.features.returns, &features)
     }
 
     /// Applies `action` (target weight in [0, 1]) at the current close,
@@ -195,15 +141,20 @@ impl<'a> TradingEnv<'a> {
         self.pf.on_close(action);
         self.i += 1;
         let bar = &self.bars[self.i];
+        if let Some(features) = self.rolling.push(bar) {
+            self.features = features;
+        }
         self.pf.fill_at_open(bar);
         let equity = self.pf.equity(bar.close);
         let dd = (1.0 - equity / self.peak).max(0.0);
         let excess_dd = (dd - self.cfg.dd_threshold).max(0.0);
         let dd_increase = (excess_dd - self.prev_excess_dd).max(0.0);
         let turnover = (self.pf.turnover - self.prev_turnover) / self.prev_equity.max(1e-12);
+        let exposure = self.pf.position_weight(bar.close);
         let reward = (equity / self.prev_equity).ln()
             - self.cfg.dd_penalty * dd_increase
-            - self.cfg.turnover_penalty * turnover;
+            - self.cfg.turnover_penalty * turnover
+            - self.cfg.vol_penalty * exposure * self.features.volatility;
         self.peak = self.peak.max(equity);
         self.prev_excess_dd = excess_dd;
         self.prev_equity = equity;
@@ -236,11 +187,28 @@ mod tests {
             .collect()
     }
 
+    fn ts(y: i32, m: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    }
+
+    fn bar_at(t: chrono::DateTime<chrono::Utc>, open: f64, close: f64) -> Bar {
+        Bar {
+            timestamp: t,
+            open,
+            high: open.max(close),
+            low: open.min(close),
+            close,
+            volume: 1000.0,
+        }
+    }
+
     fn cfg(window: usize, dd: f64, turnover: f64) -> EnvConfig {
         EnvConfig {
             window,
             dd_penalty: dd,
             dd_threshold: 0.0,
+            vol_penalty: 0.0,
             turnover_penalty: turnover,
             initial_cash: 10_000.0,
             fee_bps: 0.0,
@@ -253,6 +221,7 @@ mod tests {
             window,
             dd_penalty: dd,
             dd_threshold: threshold,
+            vol_penalty: 0.0,
             turnover_penalty: 0.0,
             initial_cash: 10_000.0,
             fee_bps: 0.0,
@@ -268,8 +237,8 @@ mod tests {
     fn obs_shape_and_initial_values() {
         let bs = bars(&[10.0, 10.0, 10.0], &[10.0, 12.0, 14.0]);
         let env = TradingEnv::new(&bs, cfg(1, 0.0, 0.0));
-        // window returns + weight + drawdown + volatility + volume ratio.
-        assert_eq!(env.obs_len(), 5);
+        // window returns + weight, drawdown, vol, volume ratio, MACD, RSI.
+        assert_eq!(env.obs_len(), 7);
         let obs = env.obs();
         approx(obs[0], 0.2);
         approx(obs[1], 0.0);
@@ -278,6 +247,9 @@ mod tests {
         approx(obs[3], 0.0);
         // Volume ratio vs the previous single bar: equal volumes -> 1.0.
         approx(obs[4], 1.0);
+        // MACD signal seeds on the first histogram value; RSI still neutral.
+        approx(obs[5], 0.0);
+        approx(obs[6], 0.0);
     }
 
     #[test]
@@ -350,8 +322,14 @@ mod tests {
             if i == 3 {
                 // The env sits flat at i == window here: weight 0, drawdown 0.
                 // Later bars would need the env to step, so stop here.
-                let (returns, vol, vr) = rolled.unwrap();
-                assert_eq!(env.obs(), obs_vector(&returns, &[0.0, 0.0, vol, vr]));
+                let f = rolled.unwrap();
+                assert_eq!(
+                    env.obs(),
+                    obs_vector(
+                        &f.returns,
+                        &[0.0, 0.0, f.volatility, f.volume_ratio, f.macd_norm, f.rsi_norm]
+                    )
+                );
                 break;
             }
         }
@@ -365,6 +343,51 @@ mod tests {
         let mut env = TradingEnv::new(&bs, cfg_thr(1, 1.0, 0.10));
         let s = env.step(1.0);
         approx(s.reward, 0.6f32.ln() - 0.3);
+    }
+
+    #[test]
+    fn vol_penalty_scales_with_exposure_and_volatility() {
+        // Window 2 over closes [10, 12, 10.8, 14]: at the final step the two
+        // returns are [-0.1, 0.2963], population stdev 0.19815. Full exposure
+        // with lambda_v = 1.0 costs 0.19815 on top of the log growth ln(1.4).
+        let bs = bars(&[10.0, 10.0, 10.0, 10.0], &[10.0, 12.0, 10.8, 14.0]);
+        let mut c = cfg(2, 0.0, 0.0);
+        c.vol_penalty = 1.0;
+        let mut env = TradingEnv::new(&bs, c);
+        let s = env.step(1.0);
+        approx(s.reward, 1.4f32.ln() - 0.198148);
+        // Flat exposure in a volatile market pays no volatility penalty.
+        let mut flat = TradingEnv::new(&bs, c);
+        approx(flat.step(0.0).reward, 0.0);
+    }
+
+    #[test]
+    fn regime_features_follow_trend() {
+        // Flat, then a sustained rise: RSI above 50 and a positive MACD
+        // histogram.
+        let mut up = RollingObs::new(3);
+        let mut last = None;
+        for i in 0..30 {
+            let close = if i < 15 { 100.0 } else { 100.0 + (i - 14) as f64 };
+            last = up
+                .push(&bar_at(ts(2024, 1, 1 + i as u32 % 28), close, close))
+                .or(last);
+        }
+        let f = last.unwrap();
+        assert!(f.rsi_norm > 0.0, "rsi_norm {}", f.rsi_norm);
+        assert!(f.macd_norm > 0.0, "macd_norm {}", f.macd_norm);
+
+        let mut down = RollingObs::new(3);
+        let mut last = None;
+        for i in 0..30 {
+            let close = if i < 15 { 100.0 } else { 100.0 - (i - 14) as f64 };
+            last = down
+                .push(&bar_at(ts(2024, 1, 1 + i as u32 % 28), close, close))
+                .or(last);
+        }
+        let f = last.unwrap();
+        assert!(f.rsi_norm < 0.0, "rsi_norm {}", f.rsi_norm);
+        assert!(f.macd_norm < 0.0, "macd_norm {}", f.macd_norm);
     }
 
     #[test]
