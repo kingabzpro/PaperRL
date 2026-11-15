@@ -15,7 +15,18 @@ Why now: the dashboard already exists and the momentum screen, risk gate, and PP
 - Automation runs in-app: a scheduler owned by the desktop process, started and stopped from the Automation tab. No daemon.
 - Ticker data comes live from Alpaca market data and is cached to parquet. The user no longer needs to pre-sync datasets.
 - Packaging is a portable exe that resolves a user-chosen data directory. No installer.
+- The scheduled bot trades the user's saved watchlist, stocks and crypto. Equities wait for market hours, crypto entries run any time. The screener path stays available through the CLI.
+- Signal verdicts are actionable: each row has Buy and Sell buttons with a notional input and a confirm step that places a paper market order.
 - Stack stays: Rust workspace, alpacars pinned =0.8.0 (isolated behind paperrl-alpaca), Dioxus 0.7 desktop, Burn PPO for model overlays.
+
+## Builder-check calls (settled defaults)
+
+- Stop cancels only bot-owned orders: those whose client order id starts with "paperrl-". Orders placed outside PaperRL are never touched.
+- When several PPO checkpoints exist for a symbol, the newest by file modification time biases the verdict, and the reason string shows its seed.
+- After a relaunch the bot always starts Idle. Nothing trades until Start is pressed in that session.
+- If the FX rates call fails, the app keeps the last good rate for the session; with no rate at all it displays USD with an "FX unavailable" note.
+- Data directory resolution is shared by the desktop app and the CLI: if a datasets folder exists next to the working directory it is used (repo checkout), otherwise $HOME/paperrl is created. PAPERRL_HOME overrides both.
+- The market-hours gate applies to equity symbols only; crypto symbols pass at any hour.
 
 ## Goals
 
@@ -38,7 +49,7 @@ Why now: the dashboard already exists and the momentum screen, risk gate, and PP
 
 Data flow for a signal: user types "AAPL, BTC/USD, TSLA" and presses Analyze. For each symbol: parse (crypto-aware) then ensure bars (parquet cache; live fetch from the stock or crypto feed when missing or stale) then compute indicators then check models dir for a PPO checkpoint then emit a Recommendation. The table renders it.
 
-The bot loop: a tokio task spawned by the desktop app, owned through a handle. Each tick checks the Alpaca clock, skips when the market is closed, then runs the existing run_once plan-and-execute with UI-configured limits. A watch channel carries state (Idle / Running / Stopping) so the tab renders live status. Stop sets the channel, cancels open orders, and joins the task. Pass results append to a JSONL history file next to the config.
+The bot loop: a tokio task spawned by the desktop app, owned through a handle. Each tick checks the Alpaca clock for equity symbols and skips them while the market is closed (crypto symbols are not gated), then plans and executes against the saved watchlist with UI-configured limits. run_once gains a universe parameter so the watchlist replaces the screener when supplied. A watch channel carries state (Idle / Running / Stopping) so the tab renders live status. Stop sets the channel, cancels bot-owned open orders, and joins the task. Pass results append to a JSONL history file next to the config.
 
 Config: one JSON file in the data directory (base currency, risk limits, bot interval, watchlist of user tickers, data dir paths). Loaded at startup, written on change. Env vars still supply API keys only.
 
@@ -70,7 +81,7 @@ paperrl-trade
 paperrl-desktop
 - Data directory: PAPERRL_HOME env override, else $USERPROFILE/paperrl (or $HOME/paperrl). First-launch creates it. Settings tab shows and can change it.
 - Tabs: Dashboard (account card with 30s refresh, market clock banner, top three signals summary), Signals (new), Portfolio (new), Automation (upgraded), Markets, Lab, Experiments unchanged, Settings (expanded).
-- Signals tab: text input accepting comma or space separated tickers, saved watchlist from config, verdict table with expandable reasons, per-symbol crypto support, refresh button, stale-data indicator per row.
+- Signals tab: text input accepting comma or space separated tickers, saved watchlist from config, verdict table with expandable reasons, per-symbol crypto support, refresh button, stale-data indicator per row, and Buy/Sell buttons per row that open a confirm dialog with a notional input and place a paper market order through the existing submission path.
 - Portfolio tab: holdings table, SVG allocation bars per asset class, SVG line chart for equity curve (reuse the hand-rolled SVG approach from CandleChart), recent fills table, currency exposure row.
 - Automation tab: run state from the handle, interval and risk limit inputs wired to config, pass history table from JSONL, market-closed notice, dry-run toggle kept.
 - Currency: all money display goes through one formatter that converts from USD to the base currency with the cached FX rate when base is not USD.

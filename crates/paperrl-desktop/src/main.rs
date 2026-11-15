@@ -10,17 +10,52 @@ use paperrl_desktop::{
     Dataset, ModelEntry, SimParams,
 };
 
+fn app_icon() -> dioxus::desktop::tao::window::Icon {
+    // Raw RGBA generated from assets/logo.svg (64x64), so no runtime decoder
+    // and no extra dependency is needed.
+    dioxus::desktop::tao::window::Icon::from_rgba(
+        include_bytes!("../../../assets/icon.rgba").to_vec(),
+        64,
+        64,
+    )
+    .expect("valid icon data")
+}
+
 fn main() {
     // PAPERRL_START_PAGE lets screenshots and demos open a specific page.
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new().with_window(
-                dioxus::desktop::WindowBuilder::new()
-                    .with_title("PaperRL")
-                    .with_inner_size(dioxus::desktop::LogicalSize::new(1280.0, 800.0)),
-            ),
-        )
-        .launch(App);
+    // Retry once with a clear message: on Windows, WebView2 cannot create
+    // its composition controller while the session is locked or the desktop
+    // is not rendering (LogonUI active), and it fails with an opaque panic.
+    for attempt in 1..=2 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dioxus::LaunchBuilder::desktop()
+                .with_cfg(
+                    dioxus::desktop::Config::new()
+                        .with_icon(app_icon())
+                        .with_window(
+                            dioxus::desktop::WindowBuilder::new()
+                                .with_title("PaperRL")
+                                .with_inner_size(dioxus::desktop::LogicalSize::new(
+                                    1280.0, 800.0,
+                                )),
+                        ),
+                )
+                .launch(App);
+        }));
+        if result.is_ok() {
+            return;
+        }
+        eprintln!(
+            "PaperRL could not open its window (attempt {attempt} of 2).
+             On Windows this usually means the desktop session is locked or not rendering:
+             WebView2 refuses to start while the logon screen is active.
+             Unlock the machine and run `cargo run -p paperrl-desktop` again."
+        );
+        if attempt == 1 {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+    }
+    std::process::exit(1);
 }
 
 fn initial_page() -> Page {
