@@ -1,22 +1,22 @@
 # PaperRL
 
-A local-first trading research platform in Rust: download market data from Alpaca, train risk-aware PPO agents on it, backtest them against classical strategies, and inspect the results. The trading engine, RL training, backtesting, storage, and CLI are all Rust; there is no Python or JavaScript in the application.
+A local-first trading app in Rust: type any tickers (stocks and crypto) and get Buy / Sell / Hold verdicts with the reasoning shown, run a paper-trading bot on a schedule from inside the app, and track the portfolio it builds. The trading engine, RL training, backtesting, storage, UI, and CLI are all Rust; there is no Python or JavaScript in the application.
 
 ## Status
 
-Phases 1 to 3 of the roadmap are built and tested (62 tests, all passing):
+Built and tested (113 tests, all passing):
 
-- Alpaca market data and paper account adapter (alpacars 0.8.0, pinned; paper API only)
-- Parquet bar storage with merge-on-write sync and schema validation
+- Alpaca adapter (alpacars 0.8.0, pinned; paper API only): account, positions with cost basis, portfolio history, fills, market clock, screener, stock and crypto bars, FX rates, buy and sell orders, and cancel-by-client-prefix
+- Parquet bar storage with merge-on-write sync and schema validation; crypto pairs cache as BTC-USD.parquet
 - Deterministic simulator: signal at close, fill at next open, fees in basis points, slippage, no leverage
 - Strategies: Buy & Hold, EMA crossover, momentum, mean reversion, volatility targeting, and a PPO policy behind one `Strategy` trait
 - Walk-forward evaluation in month-based windows with per-window and aggregate metrics
 - Risk-aware PPO on Burn 0.22 (flex CPU backend): five allocation actions (0/25/50/75/100%), regime observations (returns, volatility, volume ratio, MACD histogram, RSI, position, drawdown), reward with cost-aware growth minus excess-drawdown, turnover, and volatility penalties, seeded and reproducible, checkpoints in burnpack with JSON metadata
+- Recommendation engine (`paperrl-trade::recommend`): weighted vote over trend (price vs EMA50, EMA20 vs EMA50), 20-day momentum, MACD histogram, and RSI bands, returning Buy / Sell / Hold with a 0.5 to 1.0 confidence, human-readable reasons, and a PPO checkpoint overlay labeled with its seed
+- In-app trading bot (`paperrl-trade::spawn_bot`): trades the user's saved watchlist, skips equities while the market is closed (crypto passes any time), appends every pass to `logs/passes.jsonl`, and cancels only its own orders on stop (client order ids starting with `paperrl-`)
+- Dioxus 0.7 desktop app (`paperrl-desktop`): eight tabs covering signals, portfolio, automation, markets, lab, experiments, and settings; config and watchlist persist to `config.json`; logging goes to console and `<home>/logs/app.log`
 
-- Dioxus 0.7 desktop dashboard (`paperrl-desktop`): branded sidebar shell, live paper-account cards, SVG candlestick chart with hover OHLC, strategy comparison and walk-forward tables, a Markets browser over cached datasets, an Experiments page with training curves and one-click model backtests, and an Automation page that runs the same paper-trading pass as the CLI
-- Automated paper trading (`paperrl-trade`): momentum screen over the most active universe with liquidity filters, optional per-symbol PPO sizing, a deterministic risk gate, and Alpaca paper order submission with client order IDs, idempotent passes, and an audit log
-
-Not built yet: continuous position reconciliation and monitoring daemon, the experiment manager with redb storage, and Barter integration.
+Not built yet: continuous position reconciliation and monitoring while the app is closed, the experiment manager with redb storage, and Barter integration.
 
 ## Results
 
@@ -37,9 +37,15 @@ Seed spreads on five stocks show the variation the architecture doc asked to rec
 
 Read these numbers with the caveats they deserve. Three years of a bull-heavy sample favor Buy & Hold; the PPO walk-forward windows are not strictly out-of-sample because the agent trained on the full range; and drawdown and exposure were only recorded for Buy & Hold and PPO in this run. The full per-stock data is in `experiments/`, including `benchmark-27stocks-v2-risk-aware-ppo.csv`, `seeds-5stocks-v2.csv`, and `walkforward-27stocks-v2.csv`.
 
-## Automated paper trading
+## Trading the watchlist
 
-Two commands cover the workflow. Both require `APCA_API_KEY_ID` / `APCA_API_SECRET` and use the paper endpoint only.
+The app's bot trades what you save in the Signals tab. Equities wait for market hours (the Alpaca clock gates each pass) and crypto pairs are entered any time. Every pass appends one JSON line to `logs/passes.jsonl` with what was planned, executed, skipped, and any errors, so the Automation tab shows a full pass history. Stop cancels open orders the app created and leaves orders placed elsewhere untouched.
+
+Live verification on 2026-11-15 (a Sunday, market closed): the Signals tab analyzed `AAPL, BTC/USD, BADTICKER` and returned a Buy at 97% confidence for AAPL (with the reasoning card: price above the 50-day EMA, EMA20 over EMA50, +3.8% 20-day return, positive MACD histogram, PPO overlay), a Sell at 91% for BTC/USD through the crypto data path, and an inline error for the bad ticker. A bot started with a 60-second interval produced three history entries all marked `skipped: market closed`, and Stop returned the chip to idle. With EUR selected as base currency and the free Alpaca plan declining FX rates (HTTP 403), the app fell back to US dollars with a visible note. The portable exe launched from a directory with no data nearby and created `%USERPROFILE%\paperrl` on first run.
+
+## Automated paper trading (CLI)
+
+The CLI keeps the screener workflow. Both commands require `APCA_API_KEY_ID` / `APCA_API_SECRET` and use the paper endpoint only.
 
 ```
 # Screen the top 100 most active symbols and train this year's PPO models for the top 3 gainers
@@ -55,37 +61,46 @@ paperrl trade auto --top 100 --long 3 --execute
 paperrl trade auto --top 100 --long 3 --execute --interval 300
 ```
 
-How a pass works: it pulls the screener's most active symbols plus current movers, refreshes daily bars for anything missing or older than five days, ranks the universe by blended 20-day and 5-day momentum, sells positions whose momentum turned or dropped out of the top list, and buys the leading gainers. Liquidity filters drop names below $5 or under $2M average daily dollar volume, which keeps penny stocks and warrants out. When a `ppo-SYMBOL-42.bpk` checkpoint exists, its current target weight scales that symbol's allocation; otherwise the planner uses half of the per-position cap.
+How a pass works: it pulls the screener's most active symbols plus current movers, refreshes daily bars for anything missing or older than five days, ranks the universe by blended 20-day and 5-day momentum, sells positions whose momentum turned or dropped out of the top list, and buys the leading gainers. Liquidity filters drop names below $5 or under $2M average daily dollar volume, which keeps penny stocks and warrants out. When a checkpoint for a symbol exists, the newest one by file time scales that symbol's allocation; otherwise the planner uses half of the per-position cap.
 
 The risk gate caps position count, per-position size as a fraction of equity, per-order notional, and total spend by available cash; it never uses leverage. Symbols with open orders are treated as held, so re-running a pass cannot duplicate a buy or a sell. Every submitted order carries a `paperrl-` client order ID and is appended to `logs/orders.csv`.
 
-Live verification on 2026-11-15: a scan over a 190-symbol universe (most actives plus movers) ranked the leaders and trained three this-year models; the first automated pass submitted three paper buys of $2,000 each, all Accepted, and the account's buying power dropped by exactly $6,000 while positions stayed empty because the market was closed. A second pass immediately afterwards planned zero orders.
+Earlier verification the same day: a scan over a 190-symbol universe ranked the leaders and trained three this-year models; the first automated pass submitted three paper buys of $2,000 each, all Accepted, and the account's buying power dropped by exactly $6,000 while positions stayed empty because the market was closed. A second pass immediately afterwards planned zero orders.
 
-Known limits: leveraged single-stock ETFs (TSLL, TSLG and similar) pass the price and volume filters and can dominate momentum rankings; add an exclusion list before treating the paper results as investment evidence. Orders submitted outside market hours are queued by Alpaca for the next session.
+Known limits: leveraged single-stock ETFs (TSLL, TSLG and similar) pass the price and volume filters and can dominate momentum rankings; add an exclusion list before treating the paper results as investment evidence. Orders submitted outside market hours are queued by Alpaca for the next session. Crypto signals are rules-only today; no PPO checkpoint has been trained on crypto bars yet.
 
-## Desktop dashboard
+## Desktop app
 
-![Dashboard](screenshots/dashboard.png)
+![Signals](screenshots/signals.png)
+
+![Portfolio](screenshots/portfolio.png)
 
 ![Automation](screenshots/automation.png)
 
-![Experiments](screenshots/experiments.png)
+![Settings](screenshots/settings.png)
+
+![Dashboard](screenshots/dashboard.png)
 
 ```
 cargo run -p paperrl-desktop
 ```
 
-Five pages share the CLI's engine crates:
+Eight tabs share the engine crates:
 
-| Page | What it shows |
+| Tab | What it shows |
 |---|---|
-| Dashboard | selected dataset stats, last 120 candles with hover OHLC and a volume strip, the live paper-account card, and a strategy comparison with PPO included when a checkpoint exists |
+| Dashboard | market clock banner, the live paper-account card refreshing every 30 seconds, dataset stats, candles with hover OHLC, and a strategy comparison |
+| Signals | type any tickers (stocks and crypto), get a Buy / Sell / Hold badge with confidence, price, day and 20-day change, a "why" card listing every contributing factor, a cached-data chip, and Buy / Sell buttons with a confirm dialog that place paper orders |
+| Portfolio | holdings with avg entry, current price, market value, unrealized P&L and percent, weight per position, currency exposure (equities vs crypto), an equity curve with drawdown line over 1W / 1M / 3M / 1A, and recent fills |
 | Markets | every cached dataset with bar counts and date ranges; click to chart it |
-| Strategy Lab | editable cash, fee, and slippage; run the full comparison and six-month walk-forward aggregates |
+| Strategy Lab | editable cash, fee, and slippage with input validation; run the full comparison and six-month walk-forward aggregates |
+| Automation | bot start/stop with interval and risk limits, live state chip, pass history from `passes.jsonl`, and the manual watchlist pass (dry run or execute) |
 | Experiments | checkpoints with seed, iterations, window, final reward, training-curve sparkline, and one-click backtest against the baselines |
-| Settings | paths, credential status, and the paper-only safety model |
+| Settings | base currency (18 codes), bot interval, risk limits, data directory, credential status, and the paper-only safety model |
 
-The window launched and the account card fetched the live paper account in a smoke run; automated tests cover the data layer (dataset scanning, chart geometry, sparklines, money formatting).
+All money renders through one formatter; with a non-USD base currency it converts at the latest FX rate, and when the rate is unavailable it falls back to dollars with a visible note. Cost basis stays in USD because Alpaca settles in USD.
+
+The app resolves its data directory in this order: the `PAPERRL_HOME` environment variable, a repository checkout (a `datasets` folder beside the working directory), or `%USERPROFILE%\paperrl`. The CLI resolves paths the same way.
 
 ## Speed
 
@@ -125,14 +140,14 @@ Training and backtesting work offline from the cached Parquet datasets; only syn
 
 | Crate | What it holds |
 | --- | --- |
-| paperrl-core | Bar, Symbol, Timeframe, shared error type |
-| paperrl-alpaca | Alpaca REST adapter (data + paper account) |
-| paperrl-data | BarStore: one Parquet file per (timeframe, symbol) |
+| paperrl-core | Bar, Symbol (equities and crypto pairs), AssetClass, currency helpers, shared error type |
+| paperrl-alpaca | Alpaca REST adapter: data, screener, paper account, portfolio history, fills, clock, FX, crypto bars, orders on both sides |
+| paperrl-data | BarStore: one Parquet file per (timeframe, symbol); shared data-directory resolution |
 | paperrl-sim | Simulator, Portfolio accounting, strategies, walk-forward |
 | paperrl-rl | Feature engine, TradingEnv, and the PPO agent |
 | paperrl-cli | The `paperrl` binary |
-| paperrl-trade | Momentum screen, risk gate, paper executor |
-| paperrl-desktop | Dioxus dashboard |
+| paperrl-trade | Recommendation engine, momentum screen, risk gate, watchlist bot scheduler, app config |
+| paperrl-desktop | Dioxus trading app |
 
 Datasets land in `datasets/`, model checkpoints and their JSON metadata in `models/`. Both are gitignored.
 
