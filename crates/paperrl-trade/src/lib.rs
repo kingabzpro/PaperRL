@@ -482,7 +482,10 @@ pub fn plan_orders(input: &PlanInput) -> Vec<Intent> {
             && !long_symbols.contains(&symbol.as_str())
             && !input.pending.iter().any(|p| p == symbol)
         {
-            intents.push(Intent::Sell { symbol: symbol.clone(), qty: round4(*qty) });
+            // Sell the exact held amount: buys are notional orders, so positions carry
+            // fractional quantities, and rounding up would exceed the position and get
+            // the order rejected.
+            intents.push(Intent::Sell { symbol: symbol.clone(), qty: *qty });
             slots_freed += 1;
         }
     }
@@ -520,10 +523,6 @@ pub fn plan_orders(input: &PlanInput) -> Vec<Intent> {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
-}
-
-fn round4(v: f64) -> f64 {
-    (v * 10_000.0).round() / 10_000.0
 }
 
 /// Result of one automated pass.
@@ -900,6 +899,7 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
 #[derive(Clone)]
 pub struct BotHandle {
     state_rx: tokio::sync::watch::Receiver<BotState>,
+    state_tx: tokio::sync::watch::Sender<BotState>,
     stop_tx: tokio::sync::mpsc::Sender<()>,
     task: Arc<tokio::task::JoinHandle<()>>,
     last_pass: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
@@ -916,8 +916,10 @@ impl BotHandle {
         *self.last_pass.lock().expect("last_pass lock")
     }
 
-    /// Requests a stop; takes effect once the current pass ends.
+    /// Requests a stop; takes effect once the current pass ends. The state
+    /// chip flips to Stopping immediately, then to Idle when the loop exits.
     pub async fn stop(&self) {
+        let _ = self.state_tx.send(BotState::Stopping);
         let _ = self.stop_tx.send(()).await;
     }
 
@@ -942,9 +944,10 @@ pub fn spawn_bot(
     let (state_tx, state_rx) = tokio::sync::watch::channel(BotState::Running);
     let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<()>(1);
     let last_pass = Arc::new(std::sync::Mutex::new(None));
-    
+
     BotHandle {
         state_rx,
+        state_tx: state_tx.clone(),
         stop_tx,
         task: Arc::new(tokio::spawn(bot_loop(
             client,

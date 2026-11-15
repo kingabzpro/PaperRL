@@ -635,21 +635,36 @@ fn SignalsPage() -> Element {
         }
         let client_id = format!(
             "paperrl-manual-{}",
-            chrono::Utc::now().format("%Y%m%d%H%M%S")
+            chrono::Utc::now().format("%Y%m%d%H%M%S%3f")
         );
         spawn(async move {
             let result = async {
                 let client = alpaca_client().await?;
-                let side = if is_buy {
-                    paperrl_alpaca::OrderSideView::Buy
+                if is_buy {
+                    // Notional buys work for equities and crypto alike.
+                    let order = client
+                        .submit_market_notional_order(&sym, amount, paperrl_alpaca::OrderSideView::Buy, &client_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>(format!("{} · {}", order.status, order.client_order_id))
                 } else {
-                    paperrl_alpaca::OrderSideView::Sell
-                };
-                let order = client
-                    .submit_market_notional_order(&sym, amount, side, &client_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok::<_, String>(format!("{} · {}", order.status, order.client_order_id))
+                    // Sells close the exact held quantity: crypto rejects notional
+                    // sells, and a qty order cannot exceed the position.
+                    let positions = client.positions().await.map_err(|e| e.to_string())?;
+                    let qty = positions
+                        .iter()
+                        .find(|p| p.symbol == sym)
+                        .map(|p| p.qty)
+                        .unwrap_or(0.0);
+                    if qty <= 0.0 {
+                        return Err(format!("no open position in {sym} to sell"));
+                    }
+                    let order = client
+                        .submit_market_order(&sym, paperrl_alpaca::OrderSideView::Sell, qty, &client_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>(format!("{} · {}", order.status, order.client_order_id))
+                }
             }
             .await;
             match result {
@@ -1537,6 +1552,16 @@ fn start_pass(
     spawn(async move {
         let result = async {
             let client = alpaca_client().await?;
+            let has_equity = wcfg
+                .universe
+                .as_ref()
+                .is_some_and(|u| u.iter().any(|s| s.asset_class() == paperrl_core::AssetClass::UsEquity));
+            if execute && has_equity {
+                let clock = client.clock().await.map_err(|e| e.to_string())?;
+                if !clock.is_open {
+                    return Err("the equity market is closed; equities would only queue - use the bot (crypto still trades) or wait for the open".into());
+                }
+            }
             paperrl_trade::run_once(&client, &wcfg)
                 .await
                 .map_err(|e| e.to_string())
@@ -1650,7 +1675,7 @@ fn AutomationPage() -> Element {
                 }
                 button { class: "ghost", disabled: busy(), onclick: move |_| start_pass(false, ctx.config.cloned(), view, busy, note),
                     if busy() { "Planning..." } else { "Plan watchlist pass (dry run)" } }
-                button { class: "ghost", disabled: busy(), onclick: move |_| start_pass(true, ctx.config.cloned(), view, busy, note),
+                button { class: "ghost", disabled: busy() || bot_running, onclick: move |_| start_pass(true, ctx.config.cloned(), view, busy, note),
                     "Execute watchlist pass" }
                 button { class: "ghost", onclick: move |_| {
                     let mut h = paperrl_trade::read_pass_history(home());

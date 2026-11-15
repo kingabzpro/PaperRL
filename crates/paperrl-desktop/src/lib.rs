@@ -35,6 +35,15 @@ fn tf_from_slug(slug: &str) -> Option<Timeframe> {
     }
 }
 
+/// Parses a symbol tag from a filename: equities parse directly; crypto
+/// caches are stored as slugs (BTC-USD), so retry with `-` back to `/`.
+fn parse_symbol_flexible(tag: &str) -> Result<Symbol, paperrl_core::Error> {
+    if let Ok(s) = Symbol::parse(tag) {
+        return Ok(s);
+    }
+    Symbol::parse(&tag.replace('-', "/"))
+}
+
 /// Scans `<root>/<timeframe>/<SYMBOL>.parquet` files and summarises them.
 pub fn list_datasets(root: &Path) -> Vec<Dataset> {
     let mut out = Vec::new();
@@ -58,7 +67,7 @@ pub fn list_datasets(root: &Path) -> Vec<Dataset> {
                 continue;
             }
             let sym = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let Ok(symbol) = Symbol::parse(&sym) else {
+            let Ok(symbol) = parse_symbol_flexible(&sym) else {
                 continue;
             };
             if let Ok(bars) = BarStore::new(root).read(&symbol, tf)
@@ -78,7 +87,7 @@ pub fn list_datasets(root: &Path) -> Vec<Dataset> {
 }
 
 pub fn load_bars(root: &Path, symbol: &str, tf_slug: &str) -> Result<Vec<Bar>, String> {
-    let symbol = Symbol::parse(symbol).map_err(|e| e.to_string())?;
+    let symbol = parse_symbol_flexible(symbol).map_err(|e| e.to_string())?;
     let tf = tf_from_slug(tf_slug).ok_or_else(|| format!("unknown timeframe {tf_slug}"))?;
     BarStore::new(root).read(&symbol, tf).map_err(|e| e.to_string())
 }
@@ -483,6 +492,17 @@ mod tests {
     #[test]
     fn list_datasets_survives_missing_root() {
         assert!(list_datasets(Path::new("Z:/definitely/not/here")).is_empty());
+    }
+
+    #[test]
+    fn symbol_parse_flexible_handles_slugs() {
+        // crypto slug round-trips through the filename form
+        let s = parse_symbol_flexible("BTC-USD").unwrap();
+        assert_eq!(s.as_str(), "BTC/USD");
+        // real equity hyphen tags parse directly first
+        let s = parse_symbol_flexible("BF-B").unwrap();
+        assert_eq!(s.as_str(), "BF-B");
+        assert!(parse_symbol_flexible("NOT-A-TICKER").is_err());
     }
 
     #[test]

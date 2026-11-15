@@ -286,7 +286,9 @@ impl AlpacaClient {
             OrderSideView::Buy => OrderSide::Buy,
             OrderSideView::Sell => OrderSide::Sell,
         };
-        let mut req = OrderRequest::market(symbol, side, format!("{qty:.4}"));
+        // Lossless quantity: shortest representation that round-trips the f64, so a
+        // fractional position (notional buys) is never oversold by formatting.
+        let mut req = OrderRequest::market(symbol, side, format!("{qty}"));
         req.client_order_id = Some(client_order_id.to_string());
         let order = self.trading.submit_order(&req).await.map_err(other)?;
         Ok(SubmittedOrder {

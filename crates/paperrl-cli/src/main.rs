@@ -377,7 +377,10 @@ async fn main() -> Result<()> {
                         let ppo_cfg = PpoConfig { iters, seed, ..PpoConfig::default() };
                         let trained_model =
                             train_ppo(&subset, env_cfg, ppo_cfg, &c.symbol, "1day");
-                        let path = model_dir.join(format!("ppo-{}-{}.bpk", c.symbol, seed));
+                        let slug = paperrl_core::Symbol::parse(&c.symbol)
+                            .map(|s| s.file_slug())
+                            .unwrap_or_else(|_| c.symbol.clone());
+                        let path = model_dir.join(format!("ppo-{slug}-{seed}.bpk"));
                         trained_model.save(&path)?;
                         println!(
                             "{}: {} bars this year -> {}",
@@ -496,7 +499,8 @@ async fn main() -> Result<()> {
             );
             let trained = train_ppo(&bars, env_cfg, ppo_cfg, &symbol.to_string(), &tf.to_string());
             std::fs::create_dir_all(&out)?;
-            let path = out.join(format!("ppo-{symbol}-{seed}.bpk"));
+            let slug = symbol.file_slug();
+            let path = out.join(format!("ppo-{slug}-{seed}.bpk"));
             trained.save(&path)?;
             let first = trained.stats.first().map(|s| s.mean_reward).unwrap_or(0.0);
             let last = trained.stats.last().map(|s| s.mean_reward).unwrap_or(0.0);
