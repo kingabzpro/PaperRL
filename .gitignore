@@ -3,4 +3,5 @@
 /models
 /logs
 config.json
+credentials.json
 __pycache__/

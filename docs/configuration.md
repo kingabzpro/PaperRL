@@ -1,15 +1,33 @@
 # Configuration
 
-PaperRL reads credentials from the environment and everything else from `config.json` in its data directory. The desktop app and the CLI use the same resolution rules.
+PaperRL reads credentials from the environment first and falls back to keys saved from the desktop Settings tab. Everything else comes from `config.json`. The desktop app and the CLI use the same resolution rules, so an exported key works for both, and a key saved in the app also works for `paperrl` commands.
+
+## Credentials
+
+The environment wins: when `APCA_API_KEY_ID` and `APCA_API_SECRET` are both set, PaperRL uses them and ignores any saved file. When either is missing, it falls back to `<data dir>/credentials.json`, which **Settings → Alpaca paper keys** writes when you press **Save keys**.
+
+| Source | Used when |
+|---|---|
+| `APCA_API_KEY_ID` + `APCA_API_SECRET` | both are set; takes precedence |
+| `credentials.json` | the environment variables are absent or blank |
+| neither | Signals, Portfolio and Automation show a message pointing at Settings; backtests and the Strategy Lab still work |
+
+**Save keys** runs the launch pass immediately so verdicts appear without a relaunch. **Remove saved keys** deletes the file and leaves the environment variables in charge. **Test connection** fetches the paper account with whichever source is active; it changes nothing.
+
+At launch the status strip names the source it used: "Using the Alpaca keys in APCA_API_KEY_ID / APCA_API_SECRET" or "Using the Alpaca keys saved in Settings", and points at the Settings tab, which shows the same state as a tag.
+
+On Unix the file is created with mode `0600`. On Windows it inherits the user-profile permissions. It is plain JSON, so treat the data directory like a wallet: do not commit it, sync it, or copy it into a shared folder. `credentials.json` is gitignored. PaperRL never sends the keys anywhere except Alpaca's paper endpoint.
 
 ## Environment variables
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `APCA_API_KEY_ID` | Alpaca paper API key ID | for market data, account, portfolio, signals and orders |
-| `APCA_API_SECRET` | Alpaca paper API secret | same as above |
+| `APCA_API_KEY_ID` | Alpaca paper API key ID; wins over saved keys | for market data, account, portfolio, signals and orders |
+| `APCA_API_SECRET` | Alpaca paper API secret; same precedence | same as above |
 | `PAPERRL_HOME` | Overrides the data directory | no |
 | `RUST_LOG` | Log filter, for example `RUST_LOG=debug`; default `info` | no |
+
+Surrounding spaces are trimmed and a blank value counts as unset, so an empty export cannot shadow a saved key pair.
 
 Training, backtesting and the Strategy Lab work offline from cached Parquet bars and do not need credentials.
 
@@ -25,6 +43,7 @@ The directory uses this layout:
 
 ```
 config.json
+credentials.json
 datasets/1day/<SYMBOL>.parquet
 models/ppo-<SYMBOL>-<SEED>.bpk
 models/ppo-<SYMBOL>-<SEED>.json
@@ -85,7 +104,7 @@ paperrl data sync --symbols AAPL,MSFT --years 3
 paperrl data show --symbol AAPL --limit 5
 ```
 
-Sync accepts `1m`, `5m`, `15m`, `1h` and `1d` through `--timeframe`. Writes merge new bars into the existing Parquet file. `data sync` handles equities; crypto pairs are fetched and cached by the app's signal path.
+Sync accepts `1m`, `5m`, `15m`, `1h` and `1d` through `--timeframe`. Writes merge new bars into the existing Parquet file. Equity history honours the requested span; crypto pairs are daily only and capped at 150 days by the Alpaca crypto feed.
 
 ### Train and evaluate
 
@@ -134,14 +153,19 @@ A pass pulls the screener's most active symbols and current movers, refreshes st
 
 ## Desktop app
 
+On launch, the app checks for saved keys and the watchlist. With both present it fetches daily bars for the saved tickers, caches them, and fills the Signals tab with verdicts, reporting progress in a status strip above the page. Nothing there needs a terminal; the same two actions are buttons when you want to run them again.
+
 | Tab | Workflow |
 |---|---|
 | Signals | type tickers, analyze, expand a verdict's reasons, place a paper Buy or Sell after confirming the notional |
 | Portfolio | review holdings, weights, currency exposure, the equity curve and recent fills |
+| Markets | type tickers, pick a timeframe and year span, press Fetch market data, then click a dataset to chart it |
+| Strategy Lab | run the full comparison and walk-forward on the selected dataset |
 | Automation | start or stop the watchlist bot, set the interval, view pass history, run a dry-run or executed pass |
-| Settings | base currency, interval, risk limits, data directory, credential status |
+| Experiments | train a PPO checkpoint on a cached dataset, refresh checkpoints, inspect the training curve and backtest one against baselines |
+| Settings | paste or remove Alpaca paper keys, test the connection, set base currency, interval, risk limits and see the data directory |
 
-![Settings tab with currency, risk limits, data directory and credential status](../screenshots/settings.png)
+![Settings tab with the Alpaca paper keys card reading keys from the environment, plus the data directory note](../screenshots/settings.png)
 
 ## Bot behavior
 
@@ -160,16 +184,19 @@ Checks run on 2026-11-15 against an Alpaca paper account, with the equity market
 - With EUR as the base currency and the free plan returning HTTP 403 for FX rates, the app fell back to USD display with a visible note.
 - The portable executable launched from a directory with no data and created `%USERPROFILE%\paperrl` on first run.
 - A CLI scan over 190 symbols trained three models. The first automated pass submitted three $2,000 paper buys (all Accepted), buying power fell by $6,000, and an immediate second pass planned zero orders.
+- With placeholder keys exported as `APCA_API_KEY_ID` / `APCA_API_SECRET`, the launch strip named the environment as the source, the watchlist sync surfaced the 401, and removing the variables returned the first-run Settings prompt.
+- Settings wrote those placeholder keys to `credentials.json`, displayed only the masked tail, and Test connection reported the same 401.
+- Experiments trained a one-iteration checkpoint from the cached bars; the `.bpk` and JSON sidecar appeared and the checkpoint table refreshed without a restart.
 
 ## Known limits
 
 - Leveraged single-stock ETFs such as TSLL and TSLG pass the price and volume filters and can dominate momentum rankings. There is no exclusion list yet, so do not treat paper results as investment evidence.
 - Crypto signals use the rule vote only. No PPO checkpoint has been trained on crypto bars.
-- Crypto bars are fetched by the Signals and bot paths, capped at 150 days per request. `data sync` is equities only.
+- Crypto bars are fetched by the Signals and bot paths, capped at 150 days per request. Crypto sync from Markets or `data sync` is daily only.
 - On the free Alpaca plan, FX rates can return HTTP 403. The app falls back to USD display with a visible note.
 - `BarStore` is single-writer by convention. Do not run a desktop sync and a CLI sync against the same datasets at the same time.
 - Orders submitted outside market hours are queued by Alpaca for the next session.
 - The bot does not reconcile positions while the app is closed. There is no daemon.
-- Credentials live in the environment and are never written to disk by PaperRL.
+- Saved keys are stored as plain JSON in the data directory, readable by the signed-in user; there is no OS keychain integration yet. Use the environment variables instead if you prefer keys never to touch disk.
 
 For the reward setup and strategy definitions, see [Strategies](strategies.md). For costs, walk-forward behavior and metric definitions, see [Backtesting](backtesting.md).

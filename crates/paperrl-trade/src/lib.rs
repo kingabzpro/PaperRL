@@ -15,6 +15,14 @@ use paperrl_core::{Bar, Symbol, Timeframe};
 use paperrl_data::BarStore;
 use paperrl_sim::Strategy;
 
+mod credentials;
+mod sync;
+pub use credentials::{
+    CREDENTIALS_FILE, CredentialSource, SavedCredentials, clear_credentials, credential_source,
+    credentials_path, load_credentials, mask, resolve_credentials, save_credentials,
+};
+pub use sync::{CRYPTO_MAX_DAYS, SyncReport, SyncedSymbol, sync_history};
+
 /// Long lookback in closes for the momentum score (20 returns).
 pub const LONG_WINDOW: usize = 21;
 /// Short lookback in closes (5 returns).

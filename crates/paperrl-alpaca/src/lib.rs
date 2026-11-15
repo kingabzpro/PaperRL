@@ -33,12 +33,16 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Reads APCA_API_KEY_ID and APCA_API_SECRET.
+    /// Reads APCA_API_KEY_ID and APCA_API_SECRET, ignoring surrounding spaces
+    /// and treating a blank value as unset.
     pub fn from_env() -> Result<Self> {
-        Self::from_parts(
-            std::env::var("APCA_API_KEY_ID").ok(),
-            std::env::var("APCA_API_SECRET").ok(),
-        )
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self::from_parts(read("APCA_API_KEY_ID"), read("APCA_API_SECRET"))
     }
 
     pub fn from_parts(key_id: Option<String>, secret_key: Option<String>) -> Result<Self> {

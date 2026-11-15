@@ -11,7 +11,7 @@ PaperRL is a Cargo workspace of eight crates. The Dioxus desktop app and the `pa
 | `paperrl-data` | `BarStore`: one Parquet file per timeframe and symbol, merge-on-write sync, schema validation, shared data-directory resolution |
 | `paperrl-sim` | `Portfolio` accounting, deterministic simulator, rule strategies, walk-forward evaluation |
 | `paperrl-rl` | Feature engine, `TradingEnv`, PPO implemented on Burn 0.22 with the flex CPU backend |
-| `paperrl-trade` | Recommendation engine, momentum screen, risk gate, watchlist bot, app config |
+| `paperrl-trade` | Recommendation engine, momentum screen, risk gate, watchlist bot, app config, saved Alpaca credentials, history sync shared by both front ends |
 | `paperrl-cli` | The `paperrl` binary |
 | `paperrl-desktop` | Dioxus 0.7 desktop application |
 
@@ -42,7 +42,7 @@ Three design choices keep research and live signals comparable.
 - `paperrl_rl::RollingObs` builds observations for training and for the live PPO strategy, so a policy sees the same features in both places.
 - The backtester refuses a checkpoint trained on a different symbol, and model metadata records the symbol, timeframe, window, environment shaping and full training curve.
 
-Tests pin these invariants. The workspace has 116 tests.
+Tests pin these invariants. The workspace has 123 tests.
 
 ## Data directory
 
@@ -55,6 +55,7 @@ Both front ends resolve storage the same way:
 ```
 <data dir>/
 ├── config.json
+├── credentials.json
 ├── datasets/1day/AAPL.parquet
 ├── datasets/1day/BTC-USD.parquet
 ├── models/ppo-AAPL-42.bpk
@@ -65,7 +66,7 @@ Both front ends resolve storage the same way:
     └── orders.csv
 ```
 
-Datasets, models, logs and `config.json` are gitignored. Crypto pairs use a filesystem-safe slug, so `BTC/USD` is stored as `BTC-USD.parquet`.
+Datasets, models, logs, `config.json` and `credentials.json` are gitignored. Crypto pairs use a filesystem-safe slug, so `BTC/USD` is stored as `BTC-USD.parquet`.
 
 ## Desktop application
 
@@ -76,26 +77,28 @@ The app has eight tabs over the same engine crates:
 | Dashboard | market clock banner, paper-account card refreshed every 30 seconds, dataset stats, candles with hover OHLC, strategy comparison |
 | Signals | multi-ticker input for stocks and crypto, Buy/Sell/Hold verdicts with confidence, price, day and 20-day change, expandable reasons, cached-data chip, Buy and Sell buttons with a confirm dialog |
 | Portfolio | holdings with average entry, price, value, unrealized P&L and weight; currency exposure; equity curve with drawdown line over 1W, 1M, 3M and 1A; recent fills |
-| Markets | cached datasets with bar counts and date ranges, click to chart |
+| Markets | ticker, timeframe and year inputs with a Fetch market data button, per-symbol sync results, cached datasets with bar counts and date ranges, click to chart |
 | Strategy Lab | editable cash, fee and slippage with validation, full strategy comparison and six-month walk-forward aggregates |
 | Automation | bot start and stop, interval and risk limits, live state, pass history from `passes.jsonl`, manual watchlist pass as a dry run or executed |
-| Experiments | checkpoints with seed, iterations, window, final reward, training sparkline and one-click backtest against baselines |
-| Settings | base currency (18 codes), bot interval, risk limits, data directory, credential status, paper-only safety model |
+| Experiments | train a PPO checkpoint on a cached dataset in the background, checkpoint table with seed, iterations, window and final reward, training sparkline, one-click backtest against baselines |
+| Settings | editable Alpaca paper keys with save, remove and connection test, base currency (18 codes), bot interval, risk limits, data directory, paper-only safety model |
+
+At launch the app resolves keys (the `APCA_*` environment variables first, the keys saved in Settings second), reads the watchlist, syncs daily bars for every saved ticker, and fills the Signals tab with verdicts. The status strip names the key source and points at Settings, and the same two operations are buttons in Markets and Signals, so no workflow needs a terminal; `paperrl data sync` and `paperrl train` remain for CI and unattended runs.
 
 <p align="center">
-  <img src="../screenshots/dashboard.png" width="49%" alt="Dashboard tab with market clock, paper account card, candles and strategy comparison">
-  <img src="../screenshots/portfolio.png" width="49%" alt="Portfolio tab with holdings, equity curve and recent fills">
+  <img src="../screenshots/dashboard.png" width="49%" alt="Dashboard tab with the launch status strip, market clock, paper account card, candles and strategy comparison">
+  <img src="../screenshots/portfolio.png" width="49%" alt="Portfolio tab with account totals, an empty holdings state, the equity curve and recent fills">
 </p>
 <p align="center"><sub>Dashboard: market clock, paper account and candles. Portfolio: holdings, equity curve and fills.</sub></p>
 
 <p align="center">
   <img src="../screenshots/automation.png" width="49%" alt="Automation tab with bot controls and pass history">
-  <img src="../screenshots/experiments.png" width="49%" alt="Experiments tab with PPO checkpoints and training sparkline">
+  <img src="../screenshots/experiments.png" width="49%" alt="Experiments tab with the train checkpoint card, PPO checkpoints and a training sparkline">
 </p>
 <p align="center"><sub>Automation: bot controls and pass history. Experiments: checkpoints and training curves.</sub></p>
 
 <p align="center">
-  <img src="../screenshots/markets.png" width="49%" alt="Markets tab listing cached datasets with bar counts and date ranges">
+  <img src="../screenshots/markets.png" width="49%" alt="Markets tab with the fetch market data card and cached datasets with bar counts and date ranges">
   <img src="../screenshots/lab.png" width="49%" alt="Strategy Lab with simulator inputs and strategy comparison">
 </p>
 <p align="center"><sub>Markets: cached datasets and coverage. Strategy Lab: simulator inputs and comparison.</sub></p>
@@ -114,7 +117,7 @@ Before an order is sent, `plan_orders` applies limits on position count, positio
 cargo test --workspace
 ```
 
-The suite covers crypto symbol parsing and slugs, recommendation verdicts, PPO determinism and save/load, walk-forward window boundaries, portfolio fill accounting, the risk gate, FX conversion, config round trips and the bot state machine. The current count is 116 passing tests.
+The suite covers crypto symbol parsing and slugs, recommendation verdicts, PPO determinism and save/load, walk-forward window boundaries, portfolio fill accounting, the risk gate, FX conversion, config round trips and the bot state machine. The current count is 123 passing tests.
 
 ## Limits and planned work
 

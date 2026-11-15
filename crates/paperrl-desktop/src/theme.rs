@@ -126,7 +126,12 @@ body {
   box-shadow: 0 0 12px rgba(8, 185, 139, 0.8);
 }
 .nav-item:active { transform: translateX(2px) scale(0.985); }
-.nav-icon { width: 18px; text-align: center; opacity: 0.9; }
+.nav-icon {
+  width: 18px; height: 18px; display: inline-flex; align-items: center;
+  justify-content: center; opacity: 0.9;
+}
+.nav-icon svg { display: block; }
+.nav-item.active .nav-icon { opacity: 1; }
 .sidebar-foot { margin-top: auto; padding: 10px; font-size: 11px; color: var(--text-3); line-height: 1.5; }
 .safety-pill {
   display: inline-block; margin-top: 6px; padding: 2px 9px; border-radius: 999px;
@@ -151,6 +156,9 @@ body {
 }
 @supports not (backdrop-filter: blur(1px)) { .page-head { background: rgba(11, 18, 32, 0.97); } }
 .page-title { font-size: 21px; font-weight: 650; letter-spacing: -0.02em; }
+.title-row { display: flex; align-items: center; gap: 9px; }
+.title-icon { display: inline-flex; color: var(--text-2); }
+.title-icon svg { width: 20px; height: 20px; display: block; }
 .page-sub { color: var(--text-2); font-size: 12.5px; margin-top: 3px; }
 .head-actions { display: flex; gap: 8px; align-items: center; }
 
@@ -242,7 +250,7 @@ svg text { font-size: 10px; fill: var(--text-3); font-variant-numeric: tabular-n
 }
 
 /* ---------- controls ---------- */
-select, input[type="text"], input[type="number"] {
+select, input[type="text"], input[type="number"], input[type="password"] {
   background: var(--surface-1); color: var(--text); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: var(--radius-sm);
   padding: 8px 11px; font-size: 13px; outline: none;
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
@@ -283,6 +291,25 @@ button:disabled { opacity: 0.45; cursor: not-allowed; transform: none !important
   border-radius: 10px; padding: 10px 14px; font-size: 12.5px; margin-bottom: 16px;
   animation: rise var(--dur) var(--ease) backwards;
 }
+
+/* launch status strip: the app reports its own startup work here */
+.status-strip {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  margin: 12px 0 0; padding: 9px 14px; border-radius: 10px;
+  background: var(--surface-1); border: 1px solid var(--border);
+  color: var(--text-2); font-size: 12.5px; line-height: 1.5;
+  animation: rise var(--dur) var(--ease) backwards;
+}
+.status-strip.working {
+  background: rgba(245, 185, 76, 0.08); border-color: rgba(245, 185, 76, 0.35); color: #F5CB84;
+}
+.status-strip.done {
+  background: var(--accent-dim); border-color: rgba(8, 185, 139, 0.32); color: #8FE0C6;
+}
+.status-strip.failed {
+  background: rgba(242, 104, 92, 0.09); border-color: rgba(242, 104, 92, 0.32); color: #F5A3A8;
+}
+.status-strip button { padding: 3px 11px; font-size: 11.5px; flex: none; }
 
 /* ---------- skeletons ---------- */
 .skeleton {

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use paperrl_alpaca::{AlpacaClient, Credentials};
 use paperrl_core::{Bar, Symbol, Timeframe};
@@ -245,14 +245,10 @@ enum AlpacaCmd {
     },
 }
 
-fn parse_symbols(raw: &[String]) -> Result<Vec<Symbol>> {
-    raw.iter()
-        .map(|s| Symbol::parse(s).map_err(anyhow::Error::from))
-        .collect()
-}
-
 fn creds() -> Result<Credentials> {
-    Credentials::from_env().context("set APCA_API_KEY_ID and APCA_API_SECRET to reach Alpaca")
+    paperrl_trade::resolve_credentials(&paperrl_data::paperrl_home()).context(
+        "add your paper keys in the desktop Settings tab, or set APCA_API_KEY_ID and APCA_API_SECRET",
+    )
 }
 
 fn print_candidates(header: &str, list: &[paperrl_trade::Candidate], worst_first: bool, limit: usize) {
@@ -285,21 +281,6 @@ fn print_one(bar: &Bar) {
 /// The `limit` newest bars, oldest first.
 fn newest(bars: &[Bar], limit: usize) -> Vec<Bar> {
     bars.iter().rev().take(limit).rev().copied().collect()
-}
-
-/// Fetches and stores bars for one symbol; returns (fetched, added, stored).
-async fn sync_one(
-    client: &AlpacaClient,
-    store: &BarStore,
-    symbol: &Symbol,
-    tf: Timeframe,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Result<(usize, usize, usize)> {
-    let fetched = client.bars(symbol, tf, start, end).await?;
-    let fetched_n = fetched.len();
-    let (stored, added) = store.write(symbol, tf, &fetched)?;
-    Ok((fetched_n, added, stored))
 }
 
 #[tokio::main]
@@ -515,26 +496,26 @@ async fn main() -> Result<()> {
                 years,
                 out,
             } => {
-                let symbols = parse_symbols(&symbols)?;
                 let tf = Timeframe::parse(&timeframe)?;
                 let client = AlpacaClient::new(&creds()?)?;
-                let store = BarStore::new(out);
-                let end = Utc::now();
-                let start = end - Duration::days(365 * i64::from(years));
-                let mut failed = Vec::new();
-                for symbol in &symbols {
-                    match sync_one(&client, &store, symbol, tf, start, end).await {
-                        Ok((fetched, added, stored)) => {
-                            tracing::info!("{symbol} {tf}: {fetched} fetched, {added} added, {stored} stored");
-                        }
-                        Err(e) => {
-                            tracing::error!("{symbol}: {e:#}");
-                            failed.push(symbol.to_string());
-                        }
-                    }
+                let report = paperrl_trade::sync_history(&client, &out, &symbols, tf, years).await;
+                for s in &report.synced {
+                    tracing::info!(
+                        "{} {tf}: {} fetched, {} added, {} stored",
+                        s.symbol,
+                        s.fetched,
+                        s.added,
+                        s.stored
+                    );
                 }
-                if !failed.is_empty() {
-                    anyhow::bail!("sync failed for: {}", failed.join(", "));
+                if !report.failed.is_empty() {
+                    let detail = report
+                        .failed
+                        .iter()
+                        .map(|(symbol, error)| format!("{symbol}: {error}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    anyhow::bail!("sync failed: {detail}");
                 }
             }
             DataCmd::Show {
