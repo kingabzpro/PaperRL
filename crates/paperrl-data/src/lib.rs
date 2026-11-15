@@ -17,6 +17,37 @@ fn other<E: std::fmt::Display>(e: E) -> Error {
     Error::Other(e.to_string())
 }
 
+/// App data directory for a given working directory, given the injected
+/// `PAPERRL_HOME` value and user home. Order: env override, then a repo
+/// checkout (a `datasets` folder beside the working directory), then
+/// `<user home>/paperrl`.
+pub fn paperrl_home_from(
+    cwd: &std::path::Path,
+    paperrl_home_env: Option<&str>,
+    user_home: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(home) = paperrl_home_env.map(str::trim).filter(|h| !h.is_empty()) {
+        return PathBuf::from(home);
+    }
+    if cwd.join("datasets").is_dir() {
+        return cwd.to_path_buf();
+    }
+    user_home
+        .map(|h| h.join("paperrl"))
+        .unwrap_or_else(|| PathBuf::from("paperrl"))
+}
+
+/// App data directory for the current process: reads `PAPERRL_HOME` and
+/// the platform user-home variable, then applies [`paperrl_home_from`].
+pub fn paperrl_home() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let env = std::env::var("PAPERRL_HOME").ok();
+    let user_home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    paperrl_home_from(&cwd, env.as_deref(), user_home.as_deref())
+}
+
 fn bar_schema() -> Schema {
     Schema::new(vec![
         Field::new(
@@ -266,5 +297,46 @@ mod tests {
         let back = store.read(&sym, Timeframe::Day).unwrap();
         assert_eq!(back.len(), 3);
         assert_eq!(back[1].close, 12.0);
+    }
+
+    #[test]
+    fn home_env_var_wins() {
+        let cwd = tempfile::tempdir().unwrap();
+        let env = tempfile::tempdir().unwrap();
+        assert_eq!(
+            paperrl_home_from(cwd.path(), Some(env.path().to_str().unwrap()), None),
+            env.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn home_blank_env_ignored() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            paperrl_home_from(cwd.path(), Some("   "), Some(home.path())),
+            home.path().join("paperrl")
+        );
+    }
+
+    #[test]
+    fn home_repo_checkout_wins_over_user_home() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("datasets")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            paperrl_home_from(cwd.path(), None, Some(home.path())),
+            cwd.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn home_falls_back_to_user_dir() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            paperrl_home_from(cwd.path(), None, Some(home.path())),
+            home.path().join("paperrl")
+        );
     }
 }
