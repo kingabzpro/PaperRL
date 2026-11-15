@@ -22,10 +22,11 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 18px; }
 .brand-logo {
-  width: 30px; height: 30px; border-radius: 8px;
+  width: 32px; height: 32px; border-radius: 9px;
   background: linear-gradient(135deg, #4f8cff, #7c5cff);
   display: flex; align-items: center; justify-content: center;
-  font-weight: 700; color: #fff; font-size: 15px;
+  font-size: 17px; line-height: 1;
+  box-shadow: 0 2px 8px rgba(79, 140, 255, 0.35);
 }
 .brand-name { font-weight: 650; font-size: 15px; letter-spacing: 0.2px; }
 .brand-sub { font-size: 10.5px; color: #6b7a99; }

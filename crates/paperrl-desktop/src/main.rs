@@ -51,37 +51,7 @@ enum Page {
 #[component]
 fn Logo() -> Element {
     rsx! {
-        svg {
-            width: "30",
-            height: "30",
-            view_box: "0 0 32 32",
-            defs {
-                linearGradient {
-                    id: "brand",
-                    x1: "0", y1: "0", x2: "1", y2: "1",
-                    stop { offset: "0%", stop_color: "#4f8cff" }
-                    stop { offset: "100%", stop_color: "#7c5cff" }
-                }
-            }
-            rect { x: "0", y: "0", width: "32", height: "32", rx: "9", fill: "url(#brand)" }
-            rect { x: "7", y: "18", width: "3.5", height: "7", rx: "1", fill: "#eaf0fb", opacity: "0.75" }
-            rect { x: "13", y: "13", width: "3.5", height: "12", rx: "1", fill: "#eaf0fb", opacity: "0.9" }
-            rect { x: "19", y: "8", width: "3.5", height: "17", rx: "1", fill: "#ffffff" }
-            path {
-                d: "M6 21 L14 15 L20 11 L27 6",
-                stroke: "#bfe3ff",
-                stroke_width: "1.6",
-                fill: "none",
-                stroke_linecap: "round"
-            }
-            path {
-                d: "M23.5 6 h4 v4",
-                stroke: "#bfe3ff",
-                stroke_width: "1.6",
-                fill: "none",
-                stroke_linecap: "round"
-            }
-        }
+        div { class: "brand-logo", "📊" }
     }
 }
 
