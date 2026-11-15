@@ -140,6 +140,7 @@ pub struct AssetView {
 }
 
 /// Client for Alpaca market data and the paper account.
+#[derive(Clone)]
 pub struct AlpacaClient {
     trading: TradingClient,
     data: StockHistoricalDataClient,
@@ -455,6 +456,7 @@ fn parse_amount(value: Option<&str>, field: &str, symbol: &str) -> f64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors the nine API string fields it maps
 fn position_from_parts(
     symbol: &str,
     qty: &str,

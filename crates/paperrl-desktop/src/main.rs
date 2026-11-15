@@ -736,6 +736,7 @@ fn start_pass(
                     filter: paperrl_trade::ScreenFilter::default(),
                     execute,
                     stale_days: 5,
+                    universe: None,
                 };
                 paperrl_trade::run_once(&client, &cfg)
                     .await

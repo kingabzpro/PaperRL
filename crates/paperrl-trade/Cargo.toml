@@ -11,6 +11,9 @@ paperrl-data = { workspace = true }
 paperrl-sim = { workspace = true }
 paperrl-rl = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

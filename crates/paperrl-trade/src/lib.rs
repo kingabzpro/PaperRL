@@ -8,6 +8,7 @@
 //! hardcoded to Alpaca's paper endpoint.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use paperrl_alpaca::{AlpacaClient, OrderSideView};
 use paperrl_core::{Bar, Symbol, Timeframe};
@@ -319,9 +320,7 @@ pub fn recommend(
 
     let m = (ret20 / 0.10).clamp(-1.0, 1.0);
     score += 0.25 * m;
-    if ret20 > 0.02 {
-        reasons.push(format!("20-day return is {:+.1}%", ret20 * 100.0));
-    } else if ret20 < -0.02 {
+    if ret20.abs() > 0.02 {
         reasons.push(format!("20-day return is {:+.1}%", ret20 * 100.0));
     }
 
@@ -399,7 +398,7 @@ pub fn recommend(
 }
 
 /// Hard limits enforced before any order is sent.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RiskLimits {
     pub max_positions: usize,
     /// Cap per position as a fraction of equity.
@@ -540,6 +539,7 @@ pub struct AutoReport {
 }
 
 /// Configuration for one automated pass.
+#[derive(Clone)]
 pub struct AutoConfig {
     pub top: u32,
     pub long_count: usize,
@@ -551,6 +551,9 @@ pub struct AutoConfig {
     pub execute: bool,
     /// Bars older than this many days are refreshed before ranking.
     pub stale_days: i64,
+    /// Explicit symbol list (the saved watchlist). When set, the screener
+    /// is skipped entirely and only these symbols are ranked.
+    pub universe: Option<Vec<Symbol>>,
 }
 
 impl Default for AutoConfig {
@@ -564,8 +567,108 @@ impl Default for AutoConfig {
             filter: ScreenFilter::default(),
             execute: false,
             stale_days: 5,
+            universe: None,
         }
     }
+}
+
+/// Lifecycle state of the in-app trading bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotState {
+    Idle,
+    Running,
+    Stopping,
+}
+
+/// One entry in the append-only bot pass history.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PassEntry {
+    /// RFC3339 timestamp of the pass.
+    pub time: String,
+    /// "bot" or "manual".
+    pub mode: String,
+    pub planned: usize,
+    pub executed: usize,
+    /// Why a pass was skipped entirely (e.g. market closed), if it was.
+    pub skipped: Option<String>,
+    pub errors: Vec<String>,
+}
+
+/// App-level configuration, persisted as `config.json` in the data dir.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AppConfig {
+    /// Display currency code (USD, EUR, ...); conversion happens at render time.
+    pub base_currency: String,
+    /// Bot pass interval in seconds (minimum 60).
+    pub interval_secs: u64,
+    /// Saved tickers, e.g. ["AAPL", "BTC/USD"].
+    pub watchlist: Vec<String>,
+    pub risk: RiskLimits,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            base_currency: "USD".to_string(),
+            interval_secs: 3600,
+            watchlist: Vec::new(),
+            risk: RiskLimits::default(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Loads `config.json` from the data dir; a missing file yields defaults.
+    pub fn load(home: &Path) -> paperrl_core::Result<Self> {
+        let path = home.join("config.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(paperrl_core::Error::Io(e)),
+        };
+        serde_json::from_str(&raw).map_err(|e| paperrl_core::Error::Other(e.to_string()))
+    }
+
+    /// Writes `config.json` into the data dir, creating it if needed.
+    pub fn save(&self, home: &Path) -> paperrl_core::Result<()> {
+        std::fs::create_dir_all(home)?;
+        let path = home.join("config.json");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| paperrl_core::Error::Other(e.to_string()))?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+}
+
+/// Whether a pass should include this asset class right now: crypto trades
+/// around the clock, equities wait for the market to open.
+pub fn should_run(asset: paperrl_core::AssetClass, market_open: bool) -> bool {
+    match asset {
+        paperrl_core::AssetClass::Crypto => true,
+        paperrl_core::AssetClass::UsEquity => market_open,
+    }
+}
+
+/// Appends one pass entry to `<home>/logs/passes.jsonl`.
+pub fn append_pass_entry(home: &Path, entry: &PassEntry) -> std::io::Result<()> {
+    let dir = home.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("passes.jsonl"))?;
+    use std::io::Write;
+    writeln!(file, "{}", serde_json::to_string(entry).map_err(std::io::Error::other)?)
+}
+
+/// Reads the pass history, oldest first; unreadable lines are skipped.
+pub fn read_pass_history(home: &Path) -> Vec<PassEntry> {
+    let Ok(raw) = std::fs::read_to_string(home.join("logs").join("passes.jsonl")) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 /// The strategy weight the symbol's newest checkpoint would take on the
@@ -665,8 +768,11 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
     let now = chrono::Utc::now();
     let mut report = AutoReport::default();
 
-    // 1. Universe: most active plus screener movers, deduplicated.
-    let universe = collect_universe(client, cfg.top).await?;
+    // 1. Universe: the explicit watchlist when supplied, else the screener.
+    let universe: Vec<String> = match &cfg.universe {
+        Some(symbols) => symbols.iter().map(|s| s.as_str().to_string()).collect(),
+        None => collect_universe(client, cfg.top).await?,
+    };
     report.universe = universe.len();
 
     // 2. Ensure fresh daily bars for every universe member.
@@ -706,11 +812,10 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
         with_bars.iter().map(|(s, b)| (s.as_str(), b.as_slice())).collect();
     bars_by_symbol.sort_by(|a, b| a.0.cmp(b.0));
     for c in report.gainers.iter().take(cfg.long_count) {
-        if let Some((_, bars)) = bars_by_symbol.iter().find(|(s, _)| *s == c.symbol) {
-            if let Some(mp) = latest_model_weight(&cfg.model_dir, &c.symbol, *bars) {
+        if let Some((_, bars)) = bars_by_symbol.iter().find(|(s, _)| *s == c.symbol)
+            && let Some(mp) = latest_model_weight(&cfg.model_dir, &c.symbol, bars) {
                 model_weights.push((c.symbol.clone(), mp.weight));
             }
-        }
     }
 
     // 6. Plan under the risk gate.
@@ -787,6 +892,168 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
     }
 
     Ok(report)
+}
+
+/// Handle owning the in-app bot loop. The loop runs one pass immediately on
+/// start, then every `interval`, stopping at the next boundary when stopped.
+#[derive(Clone)]
+pub struct BotHandle {
+    state_rx: tokio::sync::watch::Receiver<BotState>,
+    stop_tx: tokio::sync::mpsc::Sender<()>,
+    task: Arc<tokio::task::JoinHandle<()>>,
+    last_pass: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl BotHandle {
+    /// Current lifecycle state.
+    pub fn state(&self) -> BotState {
+        *self.state_rx.borrow()
+    }
+
+    /// When the last pass finished, for the status line.
+    pub fn last_pass_at(&self) -> Option<std::time::Instant> {
+        *self.last_pass.lock().expect("last_pass lock")
+    }
+
+    /// Requests a stop; takes effect once the current pass ends.
+    pub async fn stop(&self) {
+        let _ = self.stop_tx.send(()).await;
+    }
+
+    /// Waits for the loop task to finish (after `stop`).
+    pub async fn join(&self) {
+        while !self.task.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Spawns the bot loop on the current tokio runtime. The loop filters the
+/// universe each tick (equities wait for market hours, crypto passes any
+/// time), runs `run_once`, and appends a history entry per pass.
+// ponytail: no pause state, stop+start covers it; add pause if users ask.
+pub fn spawn_bot(
+    client: AlpacaClient,
+    cfg: AutoConfig,
+    home: &Path,
+    interval: std::time::Duration,
+) -> BotHandle {
+    let (state_tx, state_rx) = tokio::sync::watch::channel(BotState::Running);
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let last_pass = Arc::new(std::sync::Mutex::new(None));
+    
+    BotHandle {
+        state_rx,
+        stop_tx,
+        task: Arc::new(tokio::spawn(bot_loop(
+            client,
+            cfg,
+            home.to_path_buf(),
+            interval,
+            state_tx,
+            stop_rx,
+            last_pass.clone(),
+        ))),
+        last_pass,
+    }
+}
+
+async fn bot_loop(
+    client: AlpacaClient,
+    cfg: AutoConfig,
+    home: PathBuf,
+    interval: std::time::Duration,
+    state_tx: tokio::sync::watch::Sender<BotState>,
+    mut stop_rx: tokio::sync::mpsc::Receiver<()>,
+    last_pass: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+) {
+    let mut first = true;
+    loop {
+        if !first {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = stop_rx.recv() => break,
+            }
+        }
+        first = false;
+
+        // Market-hours gate: equities wait, crypto passes any time.
+        let mut skipped: Option<String> = None;
+        let pass_symbols: Vec<Symbol> = match &cfg.universe {
+            Some(symbols) => {
+                let has_equity = symbols
+                    .iter()
+                    .any(|s| s.asset_class() == paperrl_core::AssetClass::UsEquity);
+                let market_open = if has_equity {
+                    match client.clock().await {
+                        Ok(c) => c.is_open,
+                        Err(e) => {
+                            // conservative: skip equities when the clock is unreachable
+                            skipped = Some(format!("market clock unavailable: {e}"));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                symbols
+                    .iter()
+                    .filter(|s| should_run(s.asset_class(), market_open))
+                    .cloned()
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+
+        if let Some(_symbols) = &cfg.universe {
+            if pass_symbols.is_empty() {
+                let entry = PassEntry {
+                    time: chrono::Utc::now().to_rfc3339(),
+                    mode: "bot".into(),
+                    planned: 0,
+                    executed: 0,
+                    skipped: skipped.or_else(|| Some("market closed".into())),
+                    errors: Vec::new(),
+                };
+                let _ = append_pass_entry(&home, &entry);
+                *last_pass.lock().expect("last_pass lock") = Some(std::time::Instant::now());
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                continue;
+            }
+            let mut pass_cfg = cfg.clone();
+            pass_cfg.universe = Some(pass_symbols);
+            let report = run_once(&client, &pass_cfg).await;
+            let entry = match report {
+                Ok(r) => PassEntry {
+                    time: chrono::Utc::now().to_rfc3339(),
+                    mode: "bot".into(),
+                    planned: r.plan.len(),
+                    executed: r.executed.len(),
+                    skipped,
+                    errors: r.errors,
+                },
+                Err(e) => PassEntry {
+                    time: chrono::Utc::now().to_rfc3339(),
+                    mode: "bot".into(),
+                    planned: 0,
+                    executed: 0,
+                    skipped,
+                    errors: vec![e.to_string()],
+                },
+            };
+            let _ = append_pass_entry(&home, &entry);
+            *last_pass.lock().expect("last_pass lock") = Some(std::time::Instant::now());
+        }
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+    }
+
+    // Cancel only orders this app created; leave everything else alone.
+    let _ = client.cancel_bot_orders("paperrl-").await;
+    let _ = state_tx.send(BotState::Idle);
 }
 
 #[cfg(test)]
@@ -945,6 +1212,87 @@ mod tests {
     fn no_checkpoint_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(newest_checkpoint(dir.path(), "AAPL").is_none());
+    }
+
+    #[test]
+    fn should_run_respects_market_hours() {
+        use paperrl_core::AssetClass;
+        assert!(!should_run(AssetClass::UsEquity, false));
+        assert!(should_run(AssetClass::UsEquity, true));
+        assert!(should_run(AssetClass::Crypto, false));
+    }
+
+    #[test]
+    fn config_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig {
+            base_currency: "EUR".to_string(),
+            interval_secs: 120,
+            watchlist: vec!["AAPL".into(), "BTC/USD".into()],
+            risk: RiskLimits { max_positions: 3, ..RiskLimits::default() },
+        };
+        cfg.save(dir.path()).unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn config_missing_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded, AppConfig::default());
+    }
+
+    #[test]
+    fn pass_entry_jsonl_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let e1 = PassEntry {
+            time: "2026-11-15T15:00:00Z".into(),
+            mode: "bot".into(),
+            planned: 2,
+            executed: 1,
+            skipped: None,
+            errors: vec![],
+        };
+        let e2 = PassEntry {
+            time: "2026-11-15T16:00:00Z".into(),
+            mode: "bot".into(),
+            planned: 0,
+            executed: 0,
+            skipped: Some("market closed".into()),
+            errors: vec!["AAPL: timeout".into()],
+        };
+        append_pass_entry(dir.path(), &e1).unwrap();
+        append_pass_entry(dir.path(), &e2).unwrap();
+        let history = read_pass_history(dir.path());
+        assert_eq!(history, vec![e1, e2]);
+    }
+
+    #[test]
+    fn universe_override_skips_screener() {
+        // The override path guarantees only watchlist bars reach the ranker;
+        // pin that candidates outside the supplied bars can never be planned.
+        let bars = vec![
+            ("AAPL".to_string(), rising(120)),
+            ("MSFT".to_string(), falling(120)),
+        ];
+        let ranked = rank_filtered(
+            bars.iter().map(|(s, b)| (s.as_str(), b.as_slice())),
+            ScreenFilter::default(),
+        );
+        let plan = plan_orders(&PlanInput {
+            candidates: &ranked,
+            held: &[],
+            pending: &[],
+            model_weights: &[],
+            equity: 10_000.0,
+            cash: 10_000.0,
+            limits: RiskLimits::default(),
+            long_count: 3,
+        });
+        assert!(plan.iter().all(
+            |i| matches!(i, Intent::Buy { symbol, .. } if symbol == "AAPL")
+        ));
     }
 
     #[test]

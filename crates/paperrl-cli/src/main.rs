@@ -423,6 +423,7 @@ async fn main() -> Result<()> {
                     filter: ScreenFilter { min_price, min_avg_dollar_volume: min_dollar_vol },
                     execute,
                     stale_days: 5,
+                    universe: None,
                 };
                 loop {
                     let report = run_once(&client, &cfg).await?;
