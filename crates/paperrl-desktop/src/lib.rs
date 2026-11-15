@@ -389,6 +389,30 @@ pub fn fmt_price(v: f64) -> String {
     format!("{:.2}", v)
 }
 
+/// Renders a USD amount in the base currency. `fx` is units of base per
+/// 1 USD; without a rate (or for USD itself) the value stays in dollars.
+pub fn fmt_money_display(amount_usd: f64, base: &str, fx: Option<f64>) -> String {
+    let base = paperrl_core::normalize_currency(base).unwrap_or("USD");
+    match (base, fx) {
+        ("USD", _) => paperrl_core::fmt_money(amount_usd, "USD"),
+        (_, Some(rate)) if rate > 0.0 => paperrl_core::fmt_money(amount_usd * rate, base),
+        _ => paperrl_core::fmt_money(amount_usd, "USD"),
+    }
+}
+
+/// Splits ticker input on commas, spaces, and newlines; uppercases, drops
+/// empties, and dedupes while preserving order.
+pub fn parse_watchlist_input(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in s.split([',', ' ', '\n', '\r', '\t']) {
+        let tag = raw.trim().to_uppercase();
+        if !tag.is_empty() && !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
 pub fn fmt_date(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d").to_string()
 }
@@ -461,5 +485,30 @@ mod tests {
     #[test]
     fn list_datasets_survives_missing_root() {
         assert!(list_datasets(Path::new("Z:/definitely/not/here")).is_empty());
+    }
+
+    #[test]
+    fn display_converts_with_fx() {
+        assert_eq!(fmt_money_display(100.0, "EUR", Some(0.9)), "\u{20ac}90.00");
+    }
+
+    #[test]
+    fn display_usd_ignores_fx() {
+        assert_eq!(fmt_money_display(100.0, "USD", Some(0.9)), "$100.00");
+    }
+
+    #[test]
+    fn display_falls_back_to_usd_without_fx() {
+        assert_eq!(fmt_money_display(100.0, "EUR", None), "$100.00");
+    }
+
+    #[test]
+    fn watchlist_input_parses() {
+        assert_eq!(
+            parse_watchlist_input("aapl, btc/usd  TSLA\nmsft"),
+            vec!["AAPL", "BTC/USD", "TSLA", "MSFT"]
+        );
+        assert_eq!(parse_watchlist_input("AAPL,,AAPL"), vec!["AAPL"]);
+        assert_eq!(parse_watchlist_input("   "), Vec::<String>::new());
     }
 }
