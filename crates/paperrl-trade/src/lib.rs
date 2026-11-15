@@ -461,7 +461,7 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
                 }
                 Intent::Buy { symbol, notional } => {
                     client
-                        .submit_market_notional_order(symbol, *notional, &client_id)
+                        .submit_market_notional_order(symbol, *notional, OrderSideView::Buy, &client_id)
                         .await
                 }
             };
