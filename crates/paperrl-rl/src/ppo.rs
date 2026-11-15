@@ -18,7 +18,7 @@ use rand::{RngExt, SeedableRng};
 
 use paperrl_core::Bar;
 
-use crate::{EnvConfig, TradingEnv, obs_vector};
+use crate::{EnvConfig, RollingObs, TradingEnv, obs_vector};
 
 /// Device used for training: flex CPU backend with autodiff enabled.
 fn train_device() -> Device {
@@ -66,7 +66,7 @@ impl Default for PpoConfig {
 /// Sidecar metadata saved next to every model checkpoint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelMeta {
-    /// Observation lookback used at training time (obs_len = window + 2).
+    /// Observation lookback used at training time (obs_len = window + 4).
     pub window: usize,
     pub symbol: String,
     pub timeframe: String,
@@ -147,7 +147,7 @@ impl TrainedPpo {
         .map_err(|e| paperrl_core::Error::Other(format!("{}: {e}", meta_path.display())))?;
         let device = Device::flex();
         let net = PpoNet::new(
-            meta.window + 2,
+            meta.window + 4,
             ACTION_WEIGHTS.len(),
             meta.config.hidden,
             &device,
@@ -254,7 +254,7 @@ pub fn train_ppo(
     let device = train_device();
     // Seeds network initialization (flex stores a global RNG for inits).
     device.seed(config.seed);
-    let obs_len = env_cfg.window + 2;
+    let obs_len = env_cfg.window + 4;
     let n_actions = ACTION_WEIGHTS.len();
     let mut net = PpoNet::new(obs_len, n_actions, config.hidden, &device);
     let mut opt = AdamConfig::new().init();
@@ -390,19 +390,18 @@ pub struct PpoStrategy {
     net: PpoNet,
     device: Device,
     meta: ModelMeta,
-    prev_close: Option<f64>,
-    returns: Vec<f64>,
+    rolling: RollingObs,
 }
 
 impl PpoStrategy {
     pub fn load(model_path: &Path) -> paperrl_core::Result<Self> {
         let trained = TrainedPpo::load(model_path)?;
+        let window = trained.meta.window;
         Ok(Self {
             net: trained.net,
             device: Device::flex(),
             meta: trained.meta,
-            prev_close: None,
-            returns: Vec::new(),
+            rolling: RollingObs::new(window),
         })
     }
 
@@ -418,42 +417,29 @@ impl paperrl_sim::Strategy for PpoStrategy {
     }
 
     fn on_close(&mut self, bar: &Bar, position_weight: f64, drawdown: f64) -> f64 {
-        if let Some(prev) = self.prev_close {
-            self.returns.push(bar.close / prev - 1.0);
-        }
-        self.prev_close = Some(bar.close);
-        if self.returns.len() > self.meta.window {
-            let drop = self.returns.len() - self.meta.window;
-            self.returns.drain(0..drop);
-        }
-        if self.returns.len() < self.meta.window {
+        let Some((returns, vol, volume_ratio)) = self.rolling.push(bar) else {
             // Warmup: not enough history for the observation yet.
             return 0.0;
-        }
-        let obs = obs_vector(&self.returns, position_weight, drawdown);
-        let (probs, _) = {
-            let k = obs.len();
-            let t =
-                Tensor::<2>::from_data(TensorData::new(obs, vec![1, k]), &self.device);
-            let (logits, value) = self.net.forward(t);
-            let p = activation::softmax(logits, 1)
-                .into_data()
-                .as_slice::<f32>()
-                .expect("f32 probs")
-                .to_vec();
-            let v = value.into_data().as_slice::<f32>().expect("f32 value")[0];
-            (p, v)
         };
-        let (best, _) = probs.iter().enumerate().fold(
-            (0usize, f32::NEG_INFINITY),
-            |(bi, bp), (i, &p)| {
+        let obs = obs_vector(&returns, &[position_weight, drawdown, vol, volume_ratio]);
+        let k = obs.len();
+        let t = Tensor::<2>::from_data(TensorData::new(obs, vec![1, k]), &self.device);
+        let (logits, _) = self.net.forward(t);
+        let probs = activation::softmax(logits, 1)
+            .into_data()
+            .as_slice::<f32>()
+            .expect("f32 probs")
+            .to_vec();
+        let (best, _) = probs
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bp), (i, &p)| {
                 if p > bp {
                     (i, p)
                 } else {
                     (bi, bp)
                 }
-            },
-        );
+            });
         ACTION_WEIGHTS[best]
     }
 }
@@ -592,3 +578,4 @@ mod tests {
         assert_eq!(meta.symbol, "TEST");
     }
 }
+
