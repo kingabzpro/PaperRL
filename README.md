@@ -9,7 +9,7 @@ PaperRL turns a list of tickers into Buy, Sell or Hold verdicts, shows the evide
 [![116 tests passing](https://img.shields.io/badge/tests-116%20passing-08B98B?style=flat-square)](docs/architecture.md#testing)
 [![Alpaca paper API](https://img.shields.io/badge/Alpaca-paper%20API-F5B94C?style=flat-square)](https://alpaca.markets)
 
-![PaperRL Signals tab with a Buy verdict for AAPL and a Sell for BTC/USD, each showing confidence, price context and model provenance](screenshots/signals-analyzed.png)
+![PaperRL Signals tab with a Buy verdict for AAPL and a Sell for BTC/USD, showing confidence, price context and model provenance where available](screenshots/signals-analyzed.png)
 
 ## Why PaperRL?
 

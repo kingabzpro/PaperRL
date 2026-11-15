@@ -78,14 +78,14 @@ On Windows it is `target\release\paperrl.exe`; on Linux and macOS it is `target/
 ### Data
 
 ```bash
-# Daily bars for stocks or crypto pairs; needs paper keys
-paperrl data sync --symbols AAPL,MSFT,BTC/USD --years 3
+# Daily bars for stocks; needs paper keys
+paperrl data sync --symbols AAPL,MSFT --years 3
 
 # Inspect the newest cached bars
 paperrl data show --symbol AAPL --limit 5
 ```
 
-Sync accepts `1m`, `5m`, `15m`, `1h` and `1d` through `--timeframe`. Writes merge new bars into the existing Parquet file.
+Sync accepts `1m`, `5m`, `15m`, `1h` and `1d` through `--timeframe`. Writes merge new bars into the existing Parquet file. `data sync` handles equities; crypto pairs are fetched and cached by the app's signal path.
 
 ### Train and evaluate
 
@@ -155,6 +155,7 @@ The risk gate caps position count, position size, per-order notional and total s
 
 - Leveraged single-stock ETFs such as TSLL and TSLG pass the price and volume filters and can dominate momentum rankings. There is no exclusion list yet, so do not treat paper results as investment evidence.
 - Crypto signals use the rule vote only. No PPO checkpoint has been trained on crypto bars.
+- Crypto bars are fetched by the Signals and bot paths, capped at 150 days per request. `data sync` is equities only.
 - On the free Alpaca plan, FX rates can return HTTP 403. The app falls back to USD display with a visible note.
 - `BarStore` is single-writer by convention. Do not run a desktop sync and a CLI sync against the same datasets at the same time.
 - Orders submitted outside market hours are queued by Alpaca for the next session.
