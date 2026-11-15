@@ -22,10 +22,6 @@ jobs:
             asset: paperrl-desktop-x86_64-linux
             bin: paperrl-desktop
             archive: tar.gz
-          - os: macos-13
-            asset: paperrl-desktop-x86_64-macos
-            bin: paperrl-desktop
-            archive: tar.gz
           - os: macos-latest
             asset: paperrl-desktop-aarch64-macos
             bin: paperrl-desktop
