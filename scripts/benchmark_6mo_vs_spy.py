@@ -60,27 +60,29 @@ def main():
     with open(OUT, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["symbol", "bh_ret", "ema_ret", "mom_ret", "mr_ret", "vt_ret",
-                    "ppo_ret", "bh_dd", "ppo_dd", "bh_exp", "ppo_exp", "ppo_trades"])
+                    "ppo_ret", "bh_dd", "ppo_dd", "bh_exp", "ema_exp", "mom_exp",
+                    "mr_exp", "vt_exp", "ppo_exp", "ppo_trades"])
         for sym in symbols:
             r = results[sym]
             get = lambda n, i: r[n][i] if n in r else ""
-            bh_exp = get("buyhold", 3)
-            ppo_exp = get("ppo", 3)
             w.writerow([sym, get("buyhold", 0), get("ema", 0), get("momentum", 0),
                         get("meanrev", 0), get("voltarget", 0), get("ppo", 0),
-                        get("buyhold", 1), get("ppo", 1), bh_exp, ppo_exp,
+                        get("buyhold", 1), get("ppo", 1),
+                        get("buyhold", 3), get("ema", 3), get("momentum", 3),
+                        get("meanrev", 3), get("voltarget", 3), get("ppo", 3),
                         get("ppo", 2)])
         if spy:
             w.writerow(["SPY", spy[0], "", "", "", "", "", spy[1], "", spy[2], "", ""])
 
     print(f"\nTrailing window {START} .. {END}, 27 stocks + SPY")
-    print(f"{'strategy':<12} {'mean ret':>9} {'median':>9} {'mean dd':>9}")
+    print(f"{'strategy':<12} {'mean ret':>9} {'median':>9} {'mean dd':>9} {'mean exp':>9}")
     for n in names:
         vals = sorted(results[s][n][0] for s in symbols if n in results[s])
         dds = [results[s][n][1] for s in symbols if n in results[s]]
+        exps = [results[s][n][3] for s in symbols if n in results[s]]
         if vals:
             print(f"{n:<12} {sum(vals)/len(vals):>8.2f}% {vals[len(vals)//2]:>8.2f}% "
-                  f"{sum(dds)/len(dds):>8.2f}%")
+                  f"{sum(dds)/len(dds):>8.2f}% {sum(exps)/len(exps):>8.1f}%")
     if spy:
         print(f"{'SPY bh':<12} {spy[0]:>8.2f}% {'':>9} {spy[1]:>8.2f}%")
     print("wrote", OUT)
