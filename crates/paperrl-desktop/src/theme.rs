@@ -115,5 +115,20 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   border-radius: 10px; padding: 10px 14px; font-size: 12.5px; margin-bottom: 16px;
 }
 .split { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+
+/* Signals badges and reasoning */
+.badge {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 650; letter-spacing: 0.3px;
+}
+.badge-buy { background: #0E2A26; color: #08B98B; border: 1px solid #1B5A4C; }
+.badge-sell { background: #2E1A20; color: #F2685C; border: 1px solid #6B2A34; }
+.badge-hold { background: #2E2A1A; color: #F5B94C; border: 1px solid #6B552A; }
+.why-box {
+  background: #0F1C2E; border: 1px solid #22334A; border-radius: 10px;
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 6px;
+}
+.confirm-box { border-color: #1B5A4C; background: #132A24; }
+
 @media (max-width: 1100px) { .split { grid-template-columns: 1fr; } .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 "#;

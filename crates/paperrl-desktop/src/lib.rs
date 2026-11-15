@@ -61,8 +61,8 @@ pub fn list_datasets(root: &Path) -> Vec<Dataset> {
             let Ok(symbol) = Symbol::parse(&sym) else {
                 continue;
             };
-            if let Ok(bars) = BarStore::new(root).read(&symbol, tf) {
-                if let (Some(first), Some(last)) = (bars.first(), bars.last()) {
+            if let Ok(bars) = BarStore::new(root).read(&symbol, tf)
+                && let (Some(first), Some(last)) = (bars.first(), bars.last()) {
                     out.push(Dataset {
                         symbol: symbol.to_string(),
                         timeframe: tf_name.clone(),
@@ -71,7 +71,6 @@ pub fn list_datasets(root: &Path) -> Vec<Dataset> {
                         last: last.timestamp,
                     });
                 }
-            }
         }
     }
     out.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.timeframe.cmp(&b.timeframe)));
@@ -142,11 +141,10 @@ pub fn default_strategies(ppo_model: Option<&Path>) -> Vec<Box<dyn Strategy>> {
         Box::new(MeanReversion::new(10)),
         Box::new(VolTarget::new(10, 0.15)),
     ];
-    if let Some(path) = ppo_model {
-        if let Ok(strategy) = PpoStrategy::load(path) {
+    if let Some(path) = ppo_model
+        && let Ok(strategy) = PpoStrategy::load(path) {
             strategies.push(Box::new(strategy));
         }
-    }
     strategies
 }
 

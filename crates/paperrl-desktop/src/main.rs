@@ -1,14 +1,16 @@
 //! PaperRL desktop dashboard: a local research desk over the same engine the
 //! CLI uses (Alpaca data cache, simulator, PPO checkpoints).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use dioxus::prelude::*;
 use paperrl_desktop::{
-    chart_geometry, fmt_date, fmt_money_cents, fmt_pct, fmt_price, list_datasets,
-    list_models, load_bars, run_comparison, run_walk_forward, sparkline_points, BacktestRow,
-    Dataset, ModelEntry, SimParams,
+    chart_geometry, fmt_date, fmt_money_cents, fmt_money_display, fmt_pct, fmt_price,
+    list_datasets, list_models, load_bars, parse_watchlist_input, run_comparison,
+    run_walk_forward, sparkline_points, BacktestRow, Dataset, ModelEntry, SimParams,
 };
+use paperrl_trade::AppConfig;
 
 fn app_icon() -> dioxus::desktop::tao::window::Icon {
     // Raw RGBA generated from assets/logo.svg (64x64), so no runtime decoder
@@ -65,16 +67,62 @@ fn initial_page() -> Page {
         Ok("automation") => Page::Automation,
         Ok("experiments") => Page::Experiments,
         Ok("settings") => Page::Settings,
+        Ok("signals") => Page::Signals,
+        Ok("portfolio") => Page::Portfolio,
         _ => Page::Dashboard,
     }
 }
 
-const DATASETS_ROOT: &str = "datasets";
-const MODELS_ROOT: &str = "models";
+/// App data directory, resolved once per process: PAPERRL_HOME, a repo
+/// checkout (datasets/ beside the working directory), or ~/paperrl.
+fn home() -> &'static PathBuf {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(paperrl_data::paperrl_home)
+}
+
+/// Shared app state passed through Dioxus context.
+#[derive(Clone, Copy)]
+struct AppCtx {
+    config: Signal<AppConfig>,
+    /// Units of the base currency per 1 USD; None means USD or FX unavailable.
+    fx: Signal<Option<f64>>,
+    bot: Signal<Option<paperrl_trade::BotHandle>>,
+}
+
+/// Builds an Alpaca paper client, or an error string for the UI.
+async fn alpaca_client() -> Result<paperrl_alpaca::AlpacaClient, String> {
+    let creds = paperrl_alpaca::Credentials::from_env().map_err(|e| e.to_string())?;
+    paperrl_alpaca::AlpacaClient::new(&creds).map_err(|e| e.to_string())
+}
+
+/// AutoConfig for a watchlist pass from the saved config.
+fn watchlist_config(cfg: &AppConfig, execute: bool) -> Result<paperrl_trade::AutoConfig, String> {
+    let symbols: Vec<paperrl_core::Symbol> = cfg
+        .watchlist
+        .iter()
+        .filter_map(|t| paperrl_core::Symbol::parse(t).ok())
+        .collect();
+    if symbols.is_empty() {
+        return Err("the watchlist is empty; add tickers in the Signals tab first".into());
+    }
+    Ok(paperrl_trade::AutoConfig {
+        top: 100,
+        long_count: cfg.risk.max_positions,
+        limits: cfg.risk,
+        datasets: home().join("datasets"),
+        model_dir: home().join("models"),
+        filter: paperrl_trade::ScreenFilter::default(),
+        execute,
+        stale_days: 5,
+        universe: Some(symbols),
+    })
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Dashboard,
+    Signals,
+    Portfolio,
     Markets,
     Lab,
     Automation,
@@ -112,7 +160,7 @@ fn Logo() -> Element {
 #[allow(non_snake_case)]
 fn App() -> Element {
     let mut page = use_signal(initial_page);
-    let datasets = use_signal(|| list_datasets(Path::new(DATASETS_ROOT)));
+    let datasets = use_signal(|| list_datasets(&home().join("datasets")));
     let sel = use_signal(|| {
         // PAPERRL_START_SYMBOL preselects a dataset for screenshots and demos.
         let list = datasets.read();
@@ -125,8 +173,37 @@ fn App() -> Element {
         }
     });
 
+    use_context_provider(|| AppCtx {
+        config: Signal::new(AppConfig::load(home()).unwrap_or_default()),
+        fx: Signal::new(None),
+        bot: Signal::new(None),
+    });
+    let mut ctx = use_context::<AppCtx>();
+
+    // Load the FX rate for the base currency; re-fetch when it changes.
+    use_effect(move || {
+        let base = ctx.config.cloned().base_currency;
+        spawn(async move {
+            if base == "USD" {
+                ctx.fx.set(None);
+                return;
+            }
+            let rate = async {
+                let client = alpaca_client().await?;
+                client.fx_rate(&base).await.map_err(|e| e.to_string())
+            }
+            .await;
+            match rate {
+                Ok(r) => ctx.fx.set(Some(r)),
+                Err(_) => ctx.fx.set(None),
+            }
+        });
+    });
+
     let body = match *page.read() {
         Page::Dashboard => rsx! { DashboardPage { datasets, sel } },
+        Page::Signals => rsx! { SignalsPage {} },
+        Page::Portfolio => rsx! { PortfolioPage {} },
         Page::Markets => rsx! { MarketsPage { datasets, sel } },
         Page::Lab => rsx! { LabPage { datasets, sel } },
         Page::Automation => rsx! { AutomationPage {} },
@@ -142,11 +219,13 @@ fn App() -> Element {
                     Logo {}
                     div {
                         div { class: "brand-name", "PaperRL" }
-                        div { class: "brand-sub", "local research desk" }
+                        div { class: "brand-sub", "trading desk" }
                     }
                 }
                 for (p, icon, label) in [
                     (Page::Dashboard, "▦", "Dashboard"),
+                    (Page::Signals, "📡", "Signals"),
+                    (Page::Portfolio, "💼", "Portfolio"),
                     (Page::Markets, "≋", "Markets"),
                     (Page::Lab, "⚗", "Strategy Lab"),
                     (Page::Automation, "⇄", "Automation"),
@@ -199,7 +278,7 @@ fn SymbolSelector(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element
 
 fn bars_for(datasets: &Signal<Vec<Dataset>>, sel: &Signal<usize>) -> Vec<paperrl_core::Bar> {
     match selected_dataset(datasets, sel) {
-        Some(ds) => load_bars(Path::new(DATASETS_ROOT), &ds.symbol, &ds.timeframe).unwrap_or_default(),
+        Some(ds) => load_bars(&home().join("datasets"), &ds.symbol, &ds.timeframe).unwrap_or_default(),
         None => Vec::new(),
     }
 }
@@ -215,7 +294,7 @@ fn tf_of(ds: &Dataset) -> paperrl_core::Timeframe {
 }
 
 fn ppo_model_for(symbol: &str) -> Option<PathBuf> {
-    let p = Path::new(MODELS_ROOT).join(format!("ppo-{symbol}-42.bpk"));
+    let p = home().join("models").join(format!("ppo-{}-42.bpk", paperrl_core::Symbol::parse(symbol).map(|s| s.file_slug()).unwrap_or_else(|_| symbol.to_string())));
     p.exists().then_some(p)
 }
 
@@ -252,7 +331,7 @@ fn DashboardPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element 
                     }
                 }
             }
-            div { class: "head-actions", SymbolSelector { datasets, sel } }
+            div { class: "head-actions", MarketClock {}, SymbolSelector { datasets, sel } }
         }
 
         div { class: "grid-4",
@@ -305,21 +384,22 @@ fn AccountCard() -> Element {
     let mut account = use_signal(|| None::<Result<String, String>>);
     use_effect(move || {
         spawn(async move {
-            let result = async {
-                let creds = paperrl_alpaca::Credentials::from_env().map_err(|e| e.to_string())?;
-                let client =
-                    paperrl_alpaca::AlpacaClient::new(&creds).map_err(|e| e.to_string())?;
-                let a = client.account().await.map_err(|e| e.to_string())?;
-                Ok::<_, String>(format!(
-                    "{}|{}|{}|{}",
-                    a.status,
-                    a.equity.unwrap_or_else(|| "-".into()),
-                    a.cash.unwrap_or_else(|| "-".into()),
-                    a.buying_power.unwrap_or_else(|| "-".into())
-                ))
+            loop {
+                let result = async {
+                    let client = alpaca_client().await?;
+                    let a = client.account().await.map_err(|e| e.to_string())?;
+                    Ok::<_, String>(format!(
+                        "{}|{}|{}|{}",
+                        a.status,
+                        a.equity.unwrap_or_else(|| "-".into()),
+                        a.cash.unwrap_or_else(|| "-".into()),
+                        a.buying_power.unwrap_or_else(|| "-".into())
+                    ))
+                }
+                .await;
+                account.set(Some(result));
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
-            .await;
-            account.set(Some(result));
         });
     });
 
@@ -344,6 +424,656 @@ fn AccountCard() -> Element {
                             Stat { label: "Equity".to_string(), value: equity.to_string(), sub: "paper".to_string(), class: String::new() }
                             Stat { label: "Cash".to_string(), value: cash.to_string(), sub: "available".to_string(), class: String::new() }
                             Stat { label: "Buying power".to_string(), value: bp.to_string(), sub: "margin".to_string(), class: String::new() }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One Signals row: either a verdict or the reason the ticker failed.
+#[derive(Clone)]
+struct SignalRow {
+    symbol: String,
+    result: Result<paperrl_trade::Recommendation, String>,
+    stale: bool,
+}
+
+#[allow(non_snake_case)]
+fn ActionBadge(action: paperrl_trade::Action) -> Element {
+    match action {
+        paperrl_trade::Action::Buy => rsx! { span { class: "badge badge-buy", "🟢 BUY" } },
+        paperrl_trade::Action::Sell => rsx! { span { class: "badge badge-sell", "🔴 SELL" } },
+        paperrl_trade::Action::Hold => rsx! { span { class: "badge badge-hold", "🟡 HOLD" } },
+    }
+}
+
+#[component]
+fn SignalsPage() -> Element {
+    let mut ctx = use_context::<AppCtx>();
+    let mut input = use_signal(String::new);
+    let mut rows = use_signal(Vec::<SignalRow>::new);
+    let mut busy = use_signal(|| false);
+    let mut note = use_signal(String::new);
+    let mut expanded = use_signal(|| None::<usize>);
+    // (symbol, is_buy) awaiting confirmation
+    let mut pending = use_signal(|| None::<(String, bool)>);
+    let mut notional = use_signal(String::new);
+    let config = ctx.config.cloned();
+
+    let analyze = move |_| {
+        let tags = parse_watchlist_input(&input());
+        if tags.is_empty() {
+            note.set("Type one or more tickers first, e.g. \"AAPL, BTC/USD\".".into());
+            return;
+        }
+        busy.set(true);
+        note.set(String::new());
+        rows.set(
+            tags.iter()
+                .map(|t| SignalRow { symbol: t.clone(), result: Err("loading...".into()), stale: false })
+                .collect(),
+        );
+        spawn(async move {
+            let client = match alpaca_client().await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    note.set(format!("⚠ {e}"));
+                    None
+                }
+            };
+            let positions: Vec<paperrl_alpaca::PositionView> = match &client {
+                Some(c) => c.positions().await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let mut out: Vec<SignalRow> = Vec::new();
+            for tag in tags {
+                let symbol = match paperrl_core::Symbol::parse(&tag) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        out.push(SignalRow {
+                            symbol: tag,
+                            result: Err("not a valid ticker: use AAPL style or BTC/USD".into()),
+                            stale: false,
+                        });
+                        continue;
+                    }
+                };
+                let Some(client) = &client else {
+                    out.push(SignalRow {
+                        symbol: tag,
+                        result: Err("Alpaca keys not set; see Settings".into()),
+                        stale: false,
+                    });
+                    continue;
+                };
+                let bars = match paperrl_trade::ensure_universe_bars(
+                    client,
+                    &home().join("datasets"),
+                    std::slice::from_ref(&tag),
+                    5,
+                )
+                .await
+                {
+                    Ok((with_bars, _, _)) => with_bars.into_iter().next().map(|(_, b)| b).unwrap_or_default(),
+                    Err(e) => {
+                        out.push(SignalRow { symbol: tag, result: Err(format!("data fetch failed: {e}")), stale: false });
+                        continue;
+                    }
+                };
+                if bars.is_empty() {
+                    out.push(SignalRow {
+                        symbol: tag,
+                        result: Err("no market data returned for this ticker".into()),
+                        stale: false,
+                    });
+                    continue;
+                }
+                let stale = bars
+                    .last()
+                    .map(|b| (chrono::Utc::now() - b.timestamp).num_days() > 2)
+                    .unwrap_or(false);
+                let model =
+                    paperrl_trade::latest_model_weight(&home().join("models"), symbol.as_str(), &bars);
+                let held = positions
+                    .iter()
+                    .find(|p| p.symbol == symbol.as_str())
+                    .map(|p| p.qty)
+                    .unwrap_or(0.0);
+                out.push(SignalRow {
+                    symbol: tag,
+                    result: Ok(paperrl_trade::recommend(&symbol, &bars, model, held)),
+                    stale,
+                });
+            }
+            rows.set(out);
+            busy.set(false);
+        });
+    };
+
+    let save_watchlist = move |_| {
+        let tags = parse_watchlist_input(&input());
+        if tags.is_empty() {
+            note.set("Nothing to save; type tickers first.".into());
+            return;
+        }
+        let mut cfg = ctx.config.cloned();
+        cfg.watchlist = tags.clone();
+        ctx.config.set(cfg.clone());
+        match cfg.save(home()) {
+            Ok(_) => note.set(format!("💾 watchlist saved: {} tickers", cfg.watchlist.len())),
+            Err(e) => note.set(format!("⚠ could not save: {e}")),
+        }
+    };
+
+    let load_watchlist = move |_| {
+        input.set(ctx.config.cloned().watchlist.join(", "));
+    };
+
+    let confirm = move |_| {
+        let Some((sym, is_buy)) = pending() else { return };
+        let amount: f64 = notional().trim().parse().unwrap_or(0.0);
+        if amount <= 0.0 {
+            note.set("Enter an order amount in dollars first.".into());
+            return;
+        }
+        let client_id = format!(
+            "paperrl-manual-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S")
+        );
+        spawn(async move {
+            let result = async {
+                let client = alpaca_client().await?;
+                let side = if is_buy {
+                    paperrl_alpaca::OrderSideView::Buy
+                } else {
+                    paperrl_alpaca::OrderSideView::Sell
+                };
+                let order = client
+                    .submit_market_notional_order(&sym, amount, side, &client_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(format!("{} · {}", order.status, order.client_order_id))
+            }
+            .await;
+            match result {
+                Ok(s) => note.set(format!("✅ paper order submitted ({s})")),
+                Err(e) => note.set(format!("⚠ order failed: {e}")),
+            }
+            pending.set(None);
+        });
+    };
+
+    // Plain-owned views so element closures capture only owned data.
+    struct SignalRowView {
+        symbol: String,
+        stale: bool,
+        err: Option<String>,
+        action: paperrl_trade::Action,
+        conf: String,
+        price: String,
+        day: String,
+        ret20: String,
+        model: Option<u64>,
+        reasons: Vec<String>,
+        ema20: String,
+        ema50: String,
+        rsi: String,
+        macd: String,
+        ret5: String,
+        why_title: String,
+    }
+
+    let row_views: Vec<SignalRowView> = rows()
+        .iter()
+        .map(|row| match &row.result {
+            Err(e) => SignalRowView {
+                symbol: row.symbol.clone(),
+                stale: row.stale,
+                err: Some(e.clone()),
+                action: paperrl_trade::Action::Hold,
+                conf: String::new(),
+                price: String::new(),
+                day: String::new(),
+                ret20: String::new(),
+                model: None,
+                reasons: Vec::new(),
+                ema20: String::new(),
+                ema50: String::new(),
+                rsi: String::new(),
+                macd: String::new(),
+                ret5: String::new(),
+                why_title: String::new(),
+            },
+            Ok(r) => SignalRowView {
+                symbol: row.symbol.clone(),
+                stale: row.stale,
+                err: None,
+                action: r.action,
+                conf: format!("{:.0}%", r.confidence * 100.0),
+                price: fmt_price(r.indicators.price),
+                day: format!("{:+.2}%", r.indicators.change_pct),
+                ret20: fmt_pct(r.indicators.ret20),
+                model: r.model.map(|m| m.seed),
+                reasons: r.reasons.clone(),
+                ema20: fmt_price(r.indicators.ema20),
+                ema50: fmt_price(r.indicators.ema50),
+                rsi: format!("{:.0}", r.indicators.rsi14),
+                macd: format!("{:.3}", r.indicators.macd_hist),
+                ret5: fmt_pct(r.indicators.ret5),
+                why_title: format!(
+                    "Why {}? {:?} at {:.0}% confidence",
+                    row.symbol, r.action, r.confidence * 100.0
+                ),
+            },
+        })
+        .collect();
+
+    let table_rows: Vec<Element> = row_views
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let buy_sym = v.symbol.clone();
+            let sell_sym = v.symbol.clone();
+            let max_order = ctx.config.cloned().risk.max_order_notional as i64;
+            let buy = move |_| {
+                notional.set(format!("{max_order}"));
+                pending.set(Some((buy_sym.clone(), true)));
+            };
+            let sell = move |_| {
+                notional.set(format!("{max_order}"));
+                pending.set(Some((sell_sym.clone(), false)));
+            };
+            let toggle = move |_| {
+                if expanded() == Some(i) { expanded.set(None); } else { expanded.set(Some(i)); }
+            };
+            let is_open = expanded() == Some(i);
+            let v_err = v.err.clone();
+            let day_cls = if v.day.starts_with('-') { "neg" } else { "pos" };
+            rsx! {
+                tr { key: "{i}",
+                    td {
+                        span { class: "strategy-name", "{v.symbol}" }
+                        if v.stale {
+                            span { class: "tag", style: "margin-left: 6px;", "cached" }
+                        }
+                    }
+                    if let Some(e) = v_err {
+                        td { colspan: "8", class: "neg", "{e}" }
+                    } else {
+                        td { {ActionBadge(v.action)} }
+                        td { "{v.conf}" }
+                        td { "{v.price}" }
+                        td { class: day_cls, "{v.day}" }
+                        td { "{v.ret20}" }
+                        td {
+                            if let Some(seed) = v.model {
+                                span { class: "tag", "🤖 seed {seed}" }
+                            } else {
+                                span { class: "dim", "-" }
+                            }
+                        }
+                        td {
+                            button { class: "ghost", onclick: toggle, if is_open { "hide" } else { "why" } }
+                        }
+                        td {
+                            div { class: "row",
+                                button { class: "ghost", onclick: buy, "Buy" }
+                                button { class: "ghost", onclick: sell, "Sell" }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let why_card: Option<Element> = expanded()
+        .and_then(|i| row_views.get(i))
+        .filter(|v| v.err.is_none())
+        .map(|v| {
+            rsx! {
+                div { class: "card",
+                    div { class: "card-title", "{v.why_title}" }
+                    div { class: "why-box",
+                        for reason in &v.reasons {
+                            div { class: "muted-note", "• {reason}" }
+                        }
+                    }
+                    div { class: "row", style: "margin-top: 10px; gap: 18px; flex-wrap: wrap; font-size: 12px; color: #8FA3B8;",
+                        span { "EMA20 {v.ema20}" }
+                        span { "EMA50 {v.ema50}" }
+                        span { "RSI {v.rsi}" }
+                        span { "MACD hist {v.macd}" }
+                        span { "5d {v.ret5}" }
+                        span { "20d {v.ret20}" }
+                    }
+                }
+            }
+        });
+
+    rsx! {
+        div { class: "page-head",
+            div {
+                div { class: "page-title", "📡 Signals" }
+                div { class: "page-sub", "type any tickers - stocks and crypto - for a Buy / Sell / Hold verdict with its reasoning" }
+            }
+            div { class: "head-actions",
+                button { class: "ghost", onclick: load_watchlist, "📥 Load watchlist" }
+                button { onclick: analyze, disabled: busy(), if busy() { "Analyzing..." } else { "Analyze" } }
+            }
+        }
+
+        div { class: "card",
+            div { class: "row",
+                div { class: "field", style: "flex: 1; min-width: 280px;",
+                    label { "Tickers" }
+                    input {
+                        r#type: "text",
+                        value: "{input}",
+                        placeholder: "AAPL, MSFT, BTC/USD",
+                        oninput: move |e| input.set(e.value()),
+                    }
+                }
+                div { class: "field",
+                    label { " " }
+                    button { class: "ghost", onclick: save_watchlist, "💾 Save as watchlist" }
+                }
+            }
+            if !note().is_empty() {
+                div { class: "muted-note", style: "margin-top: 10px;", "{note}" }
+            }
+            if !config.watchlist.is_empty() {
+                div { class: "muted-note", style: "margin-top: 8px;",
+                    "Saved watchlist: {config.watchlist.join(\", \")}"
+                }
+            }
+        }
+
+        if !row_views.is_empty() {
+            div { class: "card",
+                div { class: "card-title", "Verdicts" }
+                table {
+                    thead {
+                        tr {
+                            th { "Ticker" }
+                            th { "Verdict" }
+                            th { "Confidence" }
+                            th { "Price" }
+                            th { "Day" }
+                            th { "20d" }
+                            th { "Model" }
+                            th { "Why" }
+                            th { "Trade" }
+                        }
+                    }
+                    tbody { for e in table_rows { {e} } }
+                }
+            }
+        }
+
+        if let Some(wc) = why_card {
+            {wc}
+        }
+
+        if let Some((sym, is_buy)) = pending() {
+            div { class: "card confirm-box",
+                div { class: "card-title",
+                    {if is_buy { format!("🛒 Buy {sym}") } else { format!("🧹 Sell {sym}") }}
+                }
+                div { class: "row",
+                    div { class: "field",
+                        label { "Order size (USD)" }
+                        input { r#type: "text", value: "{notional}", oninput: move |e| notional.set(e.value()) }
+                    }
+                    button { onclick: confirm, "Confirm paper order" }
+                    button { class: "ghost", onclick: move |_| pending.set(None), "Cancel" }
+                }
+                div { class: "muted-note", style: "margin-top: 8px;",
+                    "Market order on your Alpaca PAPER account; nothing here can reach live money."
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MarketClock() -> Element {
+    let mut clock = use_signal(|| None::<paperrl_alpaca::ClockView>);
+    use_effect(move || {
+        spawn(async move {
+            let result = async {
+                let client = alpaca_client().await?;
+                client.clock().await.map_err(|e| e.to_string())
+            }
+            .await;
+            if let Ok(c) = result {
+                clock.set(Some(c));
+            }
+        });
+    });
+    match clock() {
+        None => rsx! { span { class: "dim", "market clock unavailable" } },
+        Some(c) => rsx! {
+            span {
+                class: "tag",
+                {if c.is_open {
+                    "🟢 market open".to_string()
+                } else {
+                    format!("🔴 market closed · opens {}", fmt_date(c.next_open))
+                }}
+            }
+        },
+    }
+}
+
+#[component]
+fn PortfolioPage() -> Element {
+    let ctx = use_context::<AppCtx>();
+    let mut busy = use_signal(|| false);
+    let mut note = use_signal(String::new);
+    let mut account = use_signal(|| None::<paperrl_alpaca::AccountSummary>);
+    let mut positions = use_signal(Vec::<paperrl_alpaca::PositionView>::new);
+    let mut equity_curve = use_signal(Vec::<paperrl_alpaca::EquityPoint>::new);
+    let mut fills = use_signal(Vec::<paperrl_alpaca::FillView>::new);
+    let mut period = use_signal(|| "1M".to_string());
+
+    let mut reload = use_signal(|| 0u32);
+    let bump_reload = move |_| reload.with_mut(|r| *r += 1);
+
+    // Load on mount, when the period selector changes, and when refresh is hit.
+    use_effect(move || {
+        let want_period = period();
+        let _ = reload();
+        busy.set(true);
+        spawn(async move {
+            let result = async {
+                let client = alpaca_client().await?;
+                let acct = client.account().await.map_err(|e| e.to_string())?;
+                let pos = client.positions().await.map_err(|e| e.to_string())?;
+                let curve = client
+                    .portfolio_history(&want_period)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let fl = client.fills(20).await.map_err(|e| e.to_string())?;
+                Ok::<_, String>((acct, pos, curve, fl))
+            }
+            .await;
+            match result {
+                Ok((a, p, c, f)) => {
+                    account.set(Some(a));
+                    positions.set(p);
+                    equity_curve.set(c);
+                    fills.set(f);
+                    note.set(String::new());
+                }
+                Err(e) => note.set(format!("⚠ {e}")),
+            }
+            busy.set(false);
+        });
+    });
+
+    let fx = ctx.fx.cloned();
+    let base = ctx.config.cloned().base_currency;
+    let base_for_money = base.clone();
+    let money = move |v: f64| fmt_money_display(v, &base_for_money, fx);
+    let total_mv: f64 = positions().iter().map(|p| p.market_value).sum();
+    let crypto_mv: f64 = positions()
+        .iter()
+        .filter(|p| p.asset_class == "crypto")
+        .map(|p| p.market_value)
+        .sum();
+    let equity_mv = total_mv - crypto_mv;
+    let unrealized: f64 = positions().iter().map(|p| p.unrealized_pl).sum();
+    let equity_val: f64 = account()
+        .as_ref()
+        .and_then(|a| a.equity.as_deref().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0);
+    let fx_note = base != "USD" && fx.is_none();
+
+    // Equity curve polyline plus a running-max drawdown line.
+    let curve = equity_curve();
+    let mut poly = String::new();
+    let mut dd_path = String::new();
+    let mut min_e = 0.0;
+    let mut max_e = 0.0;
+    if curve.len() >= 2 {
+        min_e = curve.iter().map(|p| p.equity).fold(f64::INFINITY, f64::min);
+        max_e = curve.iter().map(|p| p.equity).fold(f64::NEG_INFINITY, f64::max);
+        let span = (max_e - min_e).max(1e-9);
+        let n = curve.len();
+        poly = curve
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let x = i as f64 / (n - 1) as f64 * 880.0;
+                let y = 200.0 - (p.equity - min_e) / span * 180.0;
+                format!("{x:.1},{y:.1}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut running = f64::NEG_INFINITY;
+        for (i, p) in curve.iter().enumerate() {
+            running = running.max(p.equity);
+            let x = i as f64 / (n - 1) as f64 * 880.0;
+            let y = 200.0 - (running - min_e) / span * 180.0;
+            dd_path.push_str(&if dd_path.is_empty() {
+                format!("M {x:.1} {y:.1}")
+            } else {
+                format!(" L {x:.1} {y:.1}")
+            });
+        }
+    }
+
+    rsx! {
+        div { class: "page-head",
+            div {
+                div { class: "page-title", "💼 Portfolio" }
+                div { class: "page-sub", "Alpaca paper holdings, P&L, and the equity curve. Displayed in {base}." }
+            }
+            div { class: "head-actions",
+                button { onclick: bump_reload, disabled: busy(), if busy() { "Refreshing..." } else { "↻ Refresh" } }
+            }
+        }
+
+        if !note().is_empty() {
+            div { class: "error-box", "{note}" }
+        }
+        if fx_note {
+            div { class: "muted-note", style: "margin-bottom: 12px;",
+                "FX unavailable right now, showing US dollars instead of {base}."
+            }
+        }
+
+        div { class: "grid-4",
+            Stat { label: "Equity".to_string(), value: money(equity_val), sub: "paper account".to_string(), class: String::new() }
+            Stat { label: "Market value".to_string(), value: money(total_mv), sub: "open positions".to_string(), class: String::new() }
+            Stat { label: "Unrealized P&L".to_string(),
+                value: money(unrealized),
+                sub: "all positions".to_string(),
+                class: if unrealized >= 0.0 { "pos".to_string() } else { "neg".to_string() } }
+            Stat { label: "Positions".to_string(), value: format!("{}", positions().len()), sub: "stocks and crypto".to_string(), class: String::new() }
+        }
+
+        div { class: "card",
+            div { class: "card-title", "Holdings" }
+            if positions().is_empty() {
+                div { class: "muted-note",
+                    "No open positions. Place a paper order in Signals, or run the bot in Automation."
+                }
+            } else {
+                table {
+                    thead { tr {
+                        th { "Symbol" } th { "Class" } th { "Qty" } th { "Avg entry" }
+                        th { "Price" } th { "Value" } th { "P&L" } th { "P&L %" } th { "Weight" }
+                    } }
+                    tbody {
+                        for p in positions() {
+                            tr { key: "{p.symbol}",
+                                td { span { class: "strategy-name", "{p.symbol}" } }
+                                td { span { class: "tag", "{p.asset_class}" } }
+                                td { {format!("{:.4}", p.qty)} }
+                                td { "{money(p.avg_entry_price)}" }
+                                td { "{money(p.current_price)}" }
+                                td { "{money(p.market_value)}" }
+                                td { class: if p.unrealized_pl >= 0.0 { "pos" } else { "neg" }, "{money(p.unrealized_pl)}" }
+                                td { class: if p.unrealized_plpc >= 0.0 { "pos" } else { "neg" }, {format!("{:+.2}%", p.unrealized_plpc * 100.0)} }
+                                td { {format!("{:.1}%", if total_mv > 0.0 { p.market_value / total_mv * 100.0 } else { 0.0 })} }
+                            }
+                        }
+                    }
+                }
+                div { class: "muted-note", style: "margin-top: 12px;",
+                    "Currency exposure: equities {money(equity_mv)} · crypto {money(crypto_mv)}"
+                }
+            }
+        }
+
+        div { class: "card",
+            div { class: "row", style: "justify-content: space-between; margin-bottom: 12px;",
+                div { class: "card-title", style: "margin-bottom: 0;", "Equity curve" }
+                div { class: "row",
+                    for p in ["1W", "1M", "3M", "1A"] {
+                        button {
+                            class: if *period.read() == p { "" } else { "ghost" },
+                            onclick: move |_| period.set(p.to_string()),
+                            "{p}"
+                        }
+                    }
+                }
+            }
+            if curve.len() < 2 {
+                div { class: "muted-note", "Not enough history yet for a curve." }
+            } else {
+                svg { view_box: "0 0 880 210", width: "100%", height: "210", style: "display: block;",
+                    path { d: "{dd_path}", fill: "none", stroke: "#F2685C", stroke_width: "1", stroke_dasharray: "3 4", opacity: "0.7" }
+                    polyline { points: "{poly}", fill: "none", stroke: "#08B98B", stroke_width: "2" }
+                    text { x: "4", y: "14", "{money(max_e)}" }
+                    text { x: "4", y: "200", "{money(min_e)}" }
+                }
+                div { class: "muted-note", style: "margin-top: 8px;",
+                    "Green: account equity. Red dashes: the running peak, so gaps show drawdown."
+                }
+            }
+        }
+
+        div { class: "card",
+            div { class: "card-title", "Recent fills" }
+            if fills().is_empty() {
+                div { class: "muted-note", "No fills yet." }
+            } else {
+                table {
+                    thead { tr { th { "Time" } th { "Symbol" } th { "Side" } th { "Qty" } th { "Price" } } }
+                    tbody {
+                        for f in fills() {
+                            tr { key: "{f.id}",
+                                td { "{fmt_date(f.time)}" }
+                                td { span { class: "strategy-name", "{f.symbol}" } }
+                                td { class: if f.side == "buy" { "pos" } else { "neg" }, "{f.side}" }
+                                td { {format!("{:.4}", f.qty)} }
+                                td { "{money(f.price)}" }
+                            }
                         }
                     }
                 }
@@ -699,8 +1429,6 @@ fn LabPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element {
 
 #[derive(Clone)]
 struct AutomationView {
-    gainers: Vec<(String, String, String, String)>,
-    losers: Vec<(String, String, String, String)>,
     plan: Vec<(String, String)>,
     executed: Vec<String>,
     errors: Vec<String>,
@@ -709,6 +1437,7 @@ struct AutomationView {
 
 fn start_pass(
     execute: bool,
+    cfg: AppConfig,
     view: Signal<Option<AutomationView>>,
     busy: Signal<bool>,
     note: Signal<String>,
@@ -719,136 +1448,172 @@ fn start_pass(
     if busy() {
         return;
     }
+    let wcfg = match watchlist_config(&cfg, execute) {
+        Ok(c) => c,
+        Err(e) => {
+            note.set(format!("⚠ {e}"));
+            return;
+        }
+    };
     busy.set(true);
-        note.set(String::new());
-        spawn(async move {
-            let result = async {
-                let creds =
-                    paperrl_alpaca::Credentials::from_env().map_err(|e| e.to_string())?;
-                let client =
-                    paperrl_alpaca::AlpacaClient::new(&creds).map_err(|e| e.to_string())?;
-                let cfg = paperrl_trade::AutoConfig {
-                    top: 100,
-                    long_count: 3,
-                    limits: paperrl_trade::RiskLimits::default(),
-                    datasets: std::path::PathBuf::from("datasets"),
-                    model_dir: std::path::PathBuf::from("models"),
-                    filter: paperrl_trade::ScreenFilter::default(),
-                    execute,
-                    stale_days: 5,
-                    universe: None,
-                };
-                paperrl_trade::run_once(&client, &cfg)
-                    .await
-                    .map_err(|e| e.to_string())
+    note.set(String::new());
+    spawn(async move {
+        let result = async {
+            let client = alpaca_client().await?;
+            paperrl_trade::run_once(&client, &wcfg)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        match result {
+            Ok(report) => {
+                view.set(Some(AutomationView {
+                    plan: report.plan.clone(),
+                    executed: report.executed.clone(),
+                    errors: report.errors.clone(),
+                    universe: report.universe,
+                }));
+                note.set(if execute {
+                    format!("paper pass submitted: {} orders", report.executed.len())
+                } else {
+                    "dry run complete; nothing submitted".to_string()
+                });
             }
-            .await;
-            match result {
-                Ok(report) => {
-                    let row = |c: &paperrl_trade::Candidate| {
-                        (
-                            c.symbol.clone(),
-                            fmt_pct(c.ret20),
-                            fmt_pct(c.ret5),
-                            fmt_pct(c.score),
-                        )
-                    };
-                    view.set(Some(AutomationView {
-                        gainers: report.gainers.iter().take(10).map(row).collect(),
-                        losers: report.losers.iter().rev().take(10).map(row).collect(),
-                        plan: report.plan.clone(),
-                        executed: report.executed.clone(),
-                        errors: report.errors.clone(),
-                        universe: report.universe,
-                    }));
-                    note.set(if execute {
-                        format!("paper pass submitted: {} orders", report.executed.len())
-                    } else {
-                        "dry run complete; nothing submitted".to_string()
-                    });
-                }
-                Err(e) => note.set(format!("error: {e}")),
-            }
-            busy.set(false);
-        });
-    }
-
+            Err(e) => note.set(format!("error: {e}")),
+        }
+        busy.set(false);
+    });
+}
 
 #[component]
 fn AutomationPage() -> Element {
+    let mut ctx = use_context::<AppCtx>();
     let view = use_signal(|| None::<AutomationView>);
     let busy = use_signal(|| false);
-    let note = use_signal(String::new);
+    let mut note = use_signal(String::new);
+    let mut interval_secs = use_signal(|| format!("{}", ctx.config.cloned().interval_secs));
+    let mut history = use_signal(Vec::<paperrl_trade::PassEntry>::new);
+    let bot_running = ctx.bot.cloned().is_some();
+
+    use_effect(move || {
+        let mut h = paperrl_trade::read_pass_history(home());
+        h.reverse();
+        h.truncate(50);
+        history.set(h);
+    });
+
+    let start_bot = move |_| {
+        let cfg = ctx.config.cloned();
+        let wcfg = match watchlist_config(&cfg, true) {
+            Ok(c) => c,
+            Err(e) => {
+                note.set(format!("⚠ {e}"));
+                return;
+            }
+        };
+        let secs: u64 = interval_secs().trim().parse().unwrap_or(cfg.interval_secs);
+        let secs = secs.max(60);
+        // remember the interval
+        let mut cfg2 = cfg.clone();
+        cfg2.interval_secs = secs;
+        ctx.config.set(cfg2.clone());
+        let _ = cfg2.save(home());
+        let interval = std::time::Duration::from_secs(secs);
+        spawn(async move {
+            match alpaca_client().await {
+                Ok(client) => {
+                    let handle = paperrl_trade::spawn_bot(client, wcfg, home(), interval);
+                    ctx.bot.set(Some(handle));
+                    note.set("🤖 bot started; first pass runs immediately".into());
+                }
+                Err(e) => note.set(format!("⚠ {e}")),
+            }
+        });
+    };
+
+    let stop_bot = move |_| {
+        spawn(async move {
+            if let Some(h) = ctx.bot.cloned() {
+                note.set("⏳ stopping; waiting for the current pass...".into());
+                h.stop().await;
+                h.join().await;
+                ctx.bot.set(None);
+                note.set("🛑 bot stopped; its open paper orders were cancelled".into());
+            }
+        });
+    };
+
+    let state_chip = match ctx.bot.cloned().map(|h| h.state()) {
+        Some(paperrl_trade::BotState::Running) => rsx! { span { class: "badge badge-buy", "🟢 running" } },
+        Some(paperrl_trade::BotState::Stopping) => rsx! { span { class: "badge badge-hold", "⏳ stopping" } },
+        _ => rsx! { span { class: "badge badge-hold", "⚪ idle" } },
+    };
 
     rsx! {
         div { class: "page-head",
             div {
-                div { class: "page-title", "Automation" }
+                div { class: "page-title", "⇄ Automation" }
                 div { class: "page-sub",
-                    "momentum screen over the top 100 most active symbols; sells losers, buys leaders through the risk gate"
+                    "the bot trades your saved watchlist: equities wait for market hours, crypto passes any time"
                 }
             }
-            div { class: "head-actions",
-                button {
-                    class: "ghost",
-                    disabled: busy(),
-                    onclick: move |_| start_pass(false, view, busy, note),
-                    if busy() { "Scanning..." } else { "Scan (dry run)" }
-                }
-                button {
-                    disabled: busy(),
-                    onclick: move |_| start_pass(true, view, busy, note),
-                    "Execute paper pass"
-                }
-            }
+            div { class: "head-actions", {state_chip} }
         }
+
         div { class: "card",
-            div { class: "muted-note",
-                "Orders go to your Alpaca PAPER account only. The risk gate caps positions, per-order size, and cash; orders in flight block duplicate buys. Every submission is appended to logs/orders.csv."
+            div { class: "row",
+                div { class: "field",
+                    label { "Interval (seconds)" }
+                    input { r#type: "text", value: "{interval_secs}", oninput: move |e| interval_secs.set(e.value()) }
+                }
+                if !bot_running {
+                    button { onclick: start_bot, "▶️ Start bot" }
+                } else {
+                    button { class: "ghost", onclick: stop_bot, "⏹ Stop bot" }
+                }
+                button { class: "ghost", disabled: busy(), onclick: move |_| start_pass(false, ctx.config.cloned(), view, busy, note),
+                    if busy() { "Planning..." } else { "Plan watchlist pass (dry run)" } }
+                button { class: "ghost", disabled: busy(), onclick: move |_| start_pass(true, ctx.config.cloned(), view, busy, note),
+                    "Execute watchlist pass" }
+                button { class: "ghost", onclick: move |_| {
+                    let mut h = paperrl_trade::read_pass_history(home());
+                    h.reverse();
+                    h.truncate(50);
+                    history.set(h);
+                }, "↻" }
+            }
+            div { class: "muted-note", style: "margin-top: 10px;",
+                {format!("Orders go to your Alpaca PAPER account only. The risk gate caps positions, per-order size, and cash; orders in flight block duplicate buys. Stop cancels open orders this app created. Every pass appends to {}/logs/passes.jsonl.", home().display())}
             }
             if !note().is_empty() {
                 div { class: "muted-note", style: "margin-top: 8px;", "{note}" }
             }
         }
-        if let Some(v) = view.read().clone() {
+
+        if !history().is_empty() {
             div { class: "card",
-                div { class: "card-title", "Universe: {v.universe} symbols screened" }
-                div { class: "split",
-                    div {
-                        div { class: "card-title", "Gaining momentum" }
-                        table {
-                            thead { tr { th { "Symbol" } th { "20d" } th { "5d" } th { "Score" } } }
-                            tbody {
-                                for (sym, r20, r5, score) in v.gainers {
-                                    tr {
-                                        td { span { class: "strategy-name", "{sym}" } }
-                                        td { class: "pos", "{r20}" }
-                                        td { class: "pos", "{r5}" }
-                                        td { "{score}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    div {
-                        div { class: "card-title", "Losing momentum" }
-                        table {
-                            thead { tr { th { "Symbol" } th { "20d" } th { "5d" } th { "Score" } } }
-                            tbody {
-                                for (sym, r20, r5, score) in v.losers {
-                                    tr {
-                                        td { span { class: "strategy-name", "{sym}" } }
-                                        td { class: "neg", "{r20}" }
-                                        td { "{r5}" }
-                                        td { "{score}" }
-                                    }
-                                }
+                div { class: "card-title", "Pass history (newest first)" }
+                table {
+                    thead { tr { th { "Time" } th { "Mode" } th { "Planned" } th { "Executed" } th { "Skipped" } th { "Errors" } } }
+                    tbody {
+                        for e in history() {
+                            tr { key: "{e.time}",
+                                td { "{e.time}" }
+                                td { span { class: "tag", "{e.mode}" } }
+                                td { "{e.planned}" }
+                                td { "{e.executed}" }
+                                td { {e.skipped.clone().unwrap_or_else(|| "-".into())} }
+                                td { class: if e.errors.is_empty() { "" } else { "neg" }, "{e.errors.len()}" }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if let Some(v) = view.read().clone() {
             div { class: "card",
+                div { class: "card-title", {format!("Last pass: {} watchlist symbols screened", v.universe)} }
                 div { class: "card-title", "Planned orders" }
                 if v.plan.is_empty() {
                     div { class: "muted-note", "No orders: nothing qualifies or everything is already positioned or pending." }
@@ -881,7 +1646,7 @@ fn AutomationPage() -> Element {
 
 #[component]
 fn ExperimentsPage() -> Element {
-    let models = use_signal(|| list_models(Path::new(MODELS_ROOT)));
+    let models = use_signal(|| list_models(&home().join("models")));
     let mut chosen = use_signal(|| 0usize);
     let mut rows = use_signal(Vec::<BacktestRow>::new);
     let list = models.read();
@@ -968,7 +1733,7 @@ fn ExperimentsPage() -> Element {
                 div { class: "row", style: "margin-top: 12px;",
                     button {
                         onclick: move |_| {
-                            let Ok(bars) = load_bars(Path::new(DATASETS_ROOT), &m.meta.symbol, &m.meta.timeframe) else {
+                            let Ok(bars) = load_bars(&home().join("datasets"), &m.meta.symbol, &m.meta.timeframe) else {
                                 return;
                             };
                             let tf = tf_of(&Dataset {
@@ -996,18 +1761,90 @@ fn ExperimentsPage() -> Element {
 
 #[component]
 fn SettingsPage() -> Element {
+    let mut ctx = use_context::<AppCtx>();
+    let mut currency = use_signal(|| ctx.config.cloned().base_currency);
+    let mut interval_secs = use_signal(|| format!("{}", ctx.config.cloned().interval_secs));
+    let mut max_positions = use_signal(|| format!("{}", ctx.config.cloned().risk.max_positions));
+    let mut position_pct = use_signal(|| format!("{:.0}", ctx.config.cloned().risk.position_pct * 100.0));
+    let mut max_order = use_signal(|| format!("{}", ctx.config.cloned().risk.max_order_notional as i64));
+    let mut note = use_signal(String::new);
     let has_keys = std::env::var("APCA_API_KEY_ID").is_ok() && std::env::var("APCA_API_SECRET").is_ok();
+
+    let save = move |_| {
+        let risk = paperrl_trade::RiskLimits {
+            max_positions: max_positions().trim().parse().unwrap_or(5),
+            position_pct: (position_pct().trim().parse::<f64>().unwrap_or(20.0) / 100.0).clamp(0.01, 1.0),
+            max_order_notional: max_order().trim().parse().unwrap_or(5_000.0),
+            min_order_notional: 50.0,
+        };
+        let mut cfg = ctx.config.cloned();
+        cfg.base_currency = currency();
+        cfg.interval_secs = interval_secs().trim().parse::<u64>().unwrap_or(3600).max(60);
+        cfg.risk = risk;
+        ctx.config.set(cfg.clone());
+        match cfg.save(home()) {
+            Ok(_) => note.set("💾 settings saved".into()),
+            Err(e) => note.set(format!("⚠ could not save: {e}")),
+        }
+    };
+
     rsx! {
         div { class: "page-head",
             div {
-                div { class: "page-title", "Settings" }
-                div { class: "page-sub", "paths and environment" }
+                div { class: "page-title", "⚙ Settings" }
+                div { class: "page-sub", "currency, risk limits, paths, and credentials" }
+            }
+        }
+        div { class: "card",
+            div { class: "card-title", "Display and bot" }
+            div { class: "row",
+                div { class: "field",
+                    label { "Base currency" }
+                    select {
+                        value: "{currency}",
+                        onchange: move |e| currency.set(e.value()),
+                        for (code, sym) in paperrl_core::CURRENCIES {
+                            option { value: "{code}", selected: *currency.read() == *code, "{code} ({sym})" }
+                        }
+                    }
+                }
+                div { class: "field",
+                    label { "Bot interval (seconds)" }
+                    input { r#type: "text", value: "{interval_secs}", oninput: move |e| interval_secs.set(e.value()) }
+                }
+            }
+            if !note().is_empty() {
+                div { class: "muted-note", style: "margin-top: 10px;", "{note}" }
+            }
+        }
+        div { class: "card",
+            div { class: "card-title", "Risk limits" }
+            div { class: "row",
+                div { class: "field",
+                    label { "Max positions" }
+                    input { r#type: "text", value: "{max_positions}", oninput: move |e| max_positions.set(e.value()) }
+                }
+                div { class: "field",
+                    label { "Position size (% of equity)" }
+                    input { r#type: "text", value: "{position_pct}", oninput: move |e| position_pct.set(e.value()) }
+                }
+                div { class: "field",
+                    label { "Max order (USD)" }
+                    input { r#type: "text", value: "{max_order}", oninput: move |e| max_order.set(e.value()) }
+                }
+                div { class: "field",
+                    label { " " }
+                    button { onclick: save, "💾 Save settings" }
+                }
+            }
+            div { class: "muted-note", style: "margin-top: 10px;",
+                "The bot and the confirm dialog read these when they start a pass; changes apply to the next pass."
             }
         }
         div { class: "card",
             div { class: "card-title", "Paths" }
             div { class: "muted-note",
-                "Datasets are read from {DATASETS_ROOT}/ and checkpoints from {MODELS_ROOT}/ relative to the working directory. Launch from the repository root, or override with a shortcut that sets the working directory."
+                {format!("Data directory: {}. Datasets in datasets/, checkpoints in models/, config.json and logs/ alongside (PAPERRL_HOME overrides; a repo checkout wins; otherwise ~/paperrl).", home().display())}
             }
         }
         div { class: "card",
@@ -1015,16 +1852,16 @@ fn SettingsPage() -> Element {
             if has_keys {
                 div { span { class: "tag", "configured" } }
                 div { class: "muted-note", style: "margin-top: 8px;",
-                    "APCA_API_KEY_ID and APCA_API_SECRET are set. The dashboard reads the paper account; order placement stays disabled until the risk engine ships."
+                    "APCA_API_KEY_ID and APCA_API_SECRET are set. Signals, portfolio, and paper orders read the paper account."
                 }
             } else {
-                div { class: "error-box", "APCA_API_KEY_ID / APCA_API_SECRET are not set. Data sync and account reads need them." }
+                div { class: "error-box", "APCA_API_KEY_ID / APCA_API_SECRET are not set. Market data, the portfolio, and orders need them; the rest of the app still works." }
             }
         }
         div { class: "card",
             div { class: "card-title", "Safety model" }
             div { class: "muted-note",
-                "The trading client is hardcoded to the Alpaca paper endpoint, so live-money orders are unreachable from this build. Backtests and training run fully offline against cached Parquet data."
+                "The trading client is hardcoded to the Alpaca paper endpoint, so live-money orders are unreachable from this build. Stop cancels only orders this app placed (client order ids starting with paperrl-)."
             }
         }
     }

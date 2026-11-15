@@ -51,7 +51,7 @@ impl Credentials {
 }
 
 /// The part of the account worth showing on screen.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AccountSummary {
     pub status: String,
     pub equity: Option<String>,
