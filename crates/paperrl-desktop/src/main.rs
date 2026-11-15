@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use dioxus::prelude::*;
 use paperrl_desktop::{
-    chart_geometry, fmt_date, fmt_money_cents, fmt_money_display, fmt_pct, fmt_price,
+    chart_geometry, fmt_date, fmt_money_cents, fmt_money_display, fmt_money_display_short, fmt_pct, fmt_price,
     list_datasets, list_models, load_bars, parse_watchlist_input, run_comparison,
     run_walk_forward, sparkline_points, BacktestRow, Dataset, ModelEntry, SimParams,
 };
@@ -89,9 +89,12 @@ fn main() {
                 .with_cfg(
                     dioxus::desktop::Config::new()
                         .with_icon(app_icon())
+                        // No menu bar; the native title bar follows the dark theme.
+                        .with_menu(None)
                         .with_window(
                             dioxus::desktop::WindowBuilder::new()
                                 .with_title("PaperRL")
+                                .with_theme(Some(dioxus::desktop::tao::window::Theme::Dark))
                                 .with_inner_size(dioxus::desktop::LogicalSize::new(
                                     1280.0, 800.0,
                                 )),
@@ -299,7 +302,7 @@ fn App() -> Element {
                     span { class: "safety-pill", "no live orders" }
                 }
             }
-            main { class: "content", {body} }
+            main { class: "content", div { class: "page", {body} } }
         }
     }
 }
@@ -424,9 +427,16 @@ fn DashboardPage(datasets: Signal<Vec<Dataset>>, sel: Signal<usize>) -> Element 
 }
 
 #[component]
-fn Stat(label: String, value: String, sub: String, class: String) -> Element {
+fn Stat(
+    label: String,
+    value: String,
+    sub: String,
+    class: String,
+    #[props(default)]
+    compact: bool,
+) -> Element {
     rsx! {
-        div { class: "stat",
+        div { class: if compact { "stat compact" } else { "stat" },
             div { class: "stat-label", "{label}" }
             div { class: "stat-value {class}", "{value}" }
             div { class: "stat-sub", "{sub}" }
@@ -436,6 +446,7 @@ fn Stat(label: String, value: String, sub: String, class: String) -> Element {
 
 #[component]
 fn AccountCard() -> Element {
+    let ctx = use_context::<AppCtx>();
     let mut account = use_signal(|| None::<Result<String, String>>);
     use_effect(move || {
         spawn(async move {
@@ -467,18 +478,24 @@ fn AccountCard() -> Element {
                 Some(Err(e)) => rsx! { div { class: "error-box", "{e}" } },
                 Some(Ok(text)) => {
                     let parts: Vec<&str> = text.split('|').collect();
-                    let equity = parts.get(1).copied().unwrap_or("-");
-                    let cash = parts.get(2).copied().unwrap_or("-");
-                    let bp = parts.get(3).copied().unwrap_or("-");
+                    let fx = ctx.fx.cloned();
+                    let base = ctx.config.cloned().base_currency;
+                    let money_or_raw = |v: &str| match v.parse::<f64>() {
+                        Ok(n) => fmt_money_display_short(n, &base, fx),
+                        Err(_) => v.to_string(),
+                    };
+                    let equity = parts.get(1).map(|v| money_or_raw(v)).unwrap_or_default();
+                    let cash = parts.get(2).map(|v| money_or_raw(v)).unwrap_or_default();
+                    let bp = parts.get(3).map(|v| money_or_raw(v)).unwrap_or_default();
                     rsx! {
                         div { class: "row", style: "justify-content: space-between;",
                             span { class: "dim", "status" }
                             span { class: "tag", "{parts.first().copied().unwrap_or(\"-\")}" }
                         }
                         div { class: "grid-4", style: "grid-template-columns: repeat(3, 1fr); margin-top: 12px; margin-bottom: 0;",
-                            Stat { label: "Equity".to_string(), value: equity.to_string(), sub: "paper".to_string(), class: String::new() }
-                            Stat { label: "Cash".to_string(), value: cash.to_string(), sub: "available".to_string(), class: String::new() }
-                            Stat { label: "Buying power".to_string(), value: bp.to_string(), sub: "margin".to_string(), class: String::new() }
+                            Stat { label: "Equity".to_string(), value: equity, sub: "paper".to_string(), class: String::new(), compact: true }
+                            Stat { label: "Cash".to_string(), value: cash, sub: "available".to_string(), class: String::new(), compact: true }
+                            Stat { label: "Buying power".to_string(), value: bp, sub: "margin".to_string(), class: String::new(), compact: true }
                         }
                     }
                 }
@@ -682,6 +699,7 @@ fn SignalsPage() -> Element {
         err: Option<String>,
         action: paperrl_trade::Action,
         conf: String,
+        conf_frac: f64,
         price: String,
         day: String,
         ret20: String,
@@ -704,6 +722,7 @@ fn SignalsPage() -> Element {
                 err: Some(e.clone()),
                 action: paperrl_trade::Action::Hold,
                 conf: String::new(),
+                conf_frac: 0.0,
                 price: String::new(),
                 day: String::new(),
                 ret20: String::new(),
@@ -722,6 +741,7 @@ fn SignalsPage() -> Element {
                 err: None,
                 action: r.action,
                 conf: format!("{:.0}%", r.confidence * 100.0),
+                conf_frac: r.confidence,
                 price: fmt_price(r.indicators.price),
                 day: format!("{:+.2}%", r.indicators.change_pct),
                 ret20: fmt_pct(r.indicators.ret20),
@@ -761,6 +781,8 @@ fn SignalsPage() -> Element {
             let is_open = expanded() == Some(i);
             let v_err = v.err.clone();
             let day_cls = if v.day.starts_with('-') { "neg" } else { "pos" };
+            let conf_w = format!("{:.0}%", v.conf_frac * 100.0);
+            let loading = v_err.as_deref() == Some("loading...");
             rsx! {
                 tr { key: "{i}",
                     td {
@@ -769,11 +791,25 @@ fn SignalsPage() -> Element {
                             span { class: "tag", style: "margin-left: 6px;", "cached" }
                         }
                     }
-                    if let Some(e) = v_err {
+                    if loading {
+                        td { colspan: "8",
+                            div { class: "row", style: "gap: 18px; max-width: 560px;",
+                                span { class: "skeleton skeleton-lg", style: "width: 84px;" }
+                                span { class: "skeleton", style: "width: 120px;" }
+                                span { class: "skeleton", style: "width: 90px;" }
+                                span { class: "skeleton", style: "flex: 1;" }
+                            }
+                        }
+                    } else if let Some(e) = v_err {
                         td { colspan: "8", class: "neg", "{e}" }
                     } else {
                         td { {ActionBadge(v.action)} }
-                        td { "{v.conf}" }
+                        td {
+                            div { class: "conf-cell",
+                                span { "{v.conf}" }
+                                span { class: "conf-bar", style: "width: {conf_w}" }
+                            }
+                        }
                         td { "{v.price}" }
                         td { class: day_cls, "{v.day}" }
                         td { "{v.ret20}" }
@@ -908,6 +944,15 @@ fn SignalsPage() -> Element {
     }
 }
 
+/// Renders a pass-history RFC3339 stamp as a local "YYYY-MM-DD HH:MM" line;
+/// falls back to the raw string when parsing fails.
+fn fmt_pass_time(raw: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(t) => t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
 #[component]
 fn MarketClock() -> Element {
     let mut clock = use_signal(|| None::<paperrl_alpaca::ClockView>);
@@ -927,11 +972,11 @@ fn MarketClock() -> Element {
         None => rsx! { span { class: "dim", "market clock unavailable" } },
         Some(c) => rsx! {
             span {
-                class: "tag",
+                class: if c.is_open { "tag badge-buy live" } else { "tag" },
                 {if c.is_open {
-                    "🟢 market open".to_string()
+                    "market open".to_string()
                 } else {
-                    format!("🔴 market closed · opens {}", fmt_date(c.next_open))
+                    format!("market closed · opens {}", fmt_date(c.next_open))
                 }}
             }
         },
@@ -1005,6 +1050,7 @@ fn PortfolioPage() -> Element {
     // Equity curve polyline plus a running-max drawdown line.
     let curve = equity_curve();
     let mut poly = String::new();
+    let mut area = String::new();
     let mut dd_path = String::new();
     let mut min_e = 0.0;
     let mut max_e = 0.0;
@@ -1034,6 +1080,13 @@ fn PortfolioPage() -> Element {
                 format!(" L {x:.1} {y:.1}")
             });
         }
+        let first_pt = curve.first().expect("checked non-empty");
+        let last_pt = curve.last().expect("checked non-empty");
+        let x0 = 0.0;
+        let x1 = 880.0;
+        let y0 = 200.0 - (first_pt.equity - min_e) / span * 180.0;
+        let y1 = 200.0 - (last_pt.equity - min_e) / span * 180.0;
+        area = format!("M {x0:.1} 200 L {x0:.1} {y0:.1} {poly} L {x1:.1} {y1:.1} L {x1:.1} 200 Z");
     }
 
     rsx! {
@@ -1117,8 +1170,17 @@ fn PortfolioPage() -> Element {
                 div { class: "muted-note", "Not enough history yet for a curve." }
             } else {
                 svg { view_box: "0 0 880 210", width: "100%", height: "210", style: "display: block;",
+                    defs {
+                        linearGradient {
+                            id: "eqgrad",
+                            x1: "0", y1: "0", x2: "0", y2: "1",
+                            stop { offset: "0%", "stop-color": "#08B98B", "stop-opacity": "0.22" }
+                            stop { offset: "100%", "stop-color": "#08B98B", "stop-opacity": "0" }
+                        }
+                    }
+                    path { d: "{area}", fill: "url(#eqgrad)" }
                     path { d: "{dd_path}", fill: "none", stroke: "#F2685C", stroke_width: "1", stroke_dasharray: "3 4", opacity: "0.7" }
-                    polyline { points: "{poly}", fill: "none", stroke: "#08B98B", stroke_width: "2" }
+                    polyline { class: "draw-line", path_length: "1", points: "{poly}", fill: "none", stroke: "#08B98B", stroke_width: "2", stroke_linejoin: "round" }
                     text { x: "4", y: "14", "{money(max_e)}" }
                     text { x: "4", y: "200", "{money(min_e)}" }
                 }
@@ -1199,6 +1261,8 @@ fn CandleChart(bars: Vec<paperrl_core::Bar>) -> Element {
                 }
                 for (i, c) in geom.candles.iter().enumerate() {
                     g {
+                        class: "candle",
+                        style: "animation-delay: {i * 6}ms",
                         onmouseenter: move |_| hovered.set(Some(i)),
                         line {
                             x1: "{c.center:.2}", y1: "{c.wick_top:.2}",
@@ -1646,9 +1710,9 @@ fn AutomationPage() -> Element {
     };
 
     let state_chip = match ctx.bot.cloned().map(|h| h.state()) {
-        Some(paperrl_trade::BotState::Running) => rsx! { span { class: "badge badge-buy", "🟢 running" } },
-        Some(paperrl_trade::BotState::Stopping) => rsx! { span { class: "badge badge-hold", "⏳ stopping" } },
-        _ => rsx! { span { class: "badge badge-hold", "⚪ idle" } },
+        Some(paperrl_trade::BotState::Running) => rsx! { span { class: "badge badge-buy live", "running" } },
+        Some(paperrl_trade::BotState::Stopping) => rsx! { span { class: "badge badge-hold live", "stopping" } },
+        _ => rsx! { span { class: "badge badge-hold", "idle" } },
     };
 
     rsx! {
@@ -1700,7 +1764,7 @@ fn AutomationPage() -> Element {
                     tbody {
                         for e in history() {
                             tr { key: "{e.time}",
-                                td { "{e.time}" }
+                                td { {fmt_pass_time(&e.time)} }
                                 td { span { class: "tag", "{e.mode}" } }
                                 td { "{e.planned}" }
                                 td { "{e.executed}" }
@@ -1811,6 +1875,8 @@ fn ExperimentsPage() -> Element {
                     rsx! {
                         svg { view_box: "0 0 880 120", width: "100%", height: "120",
                             polyline {
+                                class: "draw-line",
+                                path_length: "1",
                                 points: "{pts}",
                                 fill: "none",
                                 stroke: "#08B98B",

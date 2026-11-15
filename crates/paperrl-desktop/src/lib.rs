@@ -420,6 +420,17 @@ pub fn parse_watchlist_input(s: &str) -> Vec<String> {
     out
 }
 
+/// Like [`fmt_money_display`] but without cents, for stat cards where cent
+/// digits would crowd the box.
+pub fn fmt_money_display_short(amount_usd: f64, base: &str, fx: Option<f64>) -> String {
+    let base = paperrl_core::normalize_currency(base).unwrap_or("USD");
+    match (base, fx) {
+        ("USD", _) => paperrl_core::fmt_money_dp(amount_usd, "USD", 0),
+        (_, Some(rate)) if rate > 0.0 => paperrl_core::fmt_money_dp(amount_usd * rate, base, 0),
+        _ => paperrl_core::fmt_money_dp(amount_usd, "USD", 0),
+    }
+}
+
 pub fn fmt_date(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d").to_string()
 }
@@ -518,6 +529,13 @@ mod tests {
     #[test]
     fn display_falls_back_to_usd_without_fx() {
         assert_eq!(fmt_money_display(100.0, "EUR", None), "$100.00");
+    }
+
+    #[test]
+    fn display_short_drops_cents() {
+        assert_eq!(fmt_money_display_short(20000.0, "USD", None), "$20,000");
+        assert_eq!(fmt_money_display_short(100.0, "EUR", Some(0.9)), "€90");
+        assert_eq!(fmt_money_display_short(100.0, "EUR", None), "$100");
     }
 
     #[test]

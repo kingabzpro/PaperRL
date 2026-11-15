@@ -130,6 +130,11 @@ fn group_thousands(digits: &str) -> String {
 
 /// Renders an amount with the currency's symbol; unknown codes prefix the code instead.
 pub fn fmt_money(amount: f64, currency: &str) -> String {
+    fmt_money_dp(amount, currency, 2)
+}
+
+/// Same as [`fmt_money`] with a chosen number of decimal places.
+pub fn fmt_money_dp(amount: f64, currency: &str, decimals: usize) -> String {
     let up = currency.trim().to_uppercase();
     let known = CURRENCIES.iter().find(|(c, _)| *c == up);
     let (label, symbol) = match known {
@@ -137,9 +142,15 @@ pub fn fmt_money(amount: f64, currency: &str) -> String {
         None => (up.as_str(), ""),
     };
     let neg = amount < 0.0;
-    let fixed = format!("{:.2}", amount.abs());
-    let (int, frac) = fixed.split_once('.').unwrap_or((fixed.as_str(), "00"));
-    let body = format!("{}.{}", group_thousands(int), frac);
+    let fixed = if decimals == 0 {
+        format!("{:.0}", amount.abs())
+    } else {
+        format!("{:.*}", decimals, amount.abs())
+    };
+    let body = match fixed.split_once('.') {
+        Some((int, frac)) => format!("{}.{}", group_thousands(int), frac),
+        None => group_thousands(&fixed),
+    };
     if symbol.is_empty() {
         format!("{}{} {}", if neg { "-" } else { "" }, label, body)
     } else {
@@ -291,6 +302,13 @@ mod tests {
         assert_eq!(normalize_currency(" USD "), Some("USD"));
         assert_eq!(normalize_currency("xyz"), None);
         assert_eq!(normalize_currency(""), None);
+    }
+
+    #[test]
+    fn fmt_money_dp_controls_decimals() {
+        assert_eq!(fmt_money_dp(1234.5, "USD", 0), "$1,234");
+        assert_eq!(fmt_money_dp(1234.5, "EUR", 0), "€1,234");
+        assert_eq!(fmt_money_dp(1234.5, "USD", 2), "$1,234.50");
     }
 
     #[test]
