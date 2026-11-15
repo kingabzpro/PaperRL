@@ -88,7 +88,6 @@ fn main() {
             dioxus::LaunchBuilder::desktop()
                 .with_cfg(
                     dioxus::desktop::Config::new()
-                        .with_icon(app_icon())
                         // No menu bar; the native title bar follows the dark theme.
                         .with_menu(None)
                         .with_window(
@@ -98,7 +97,11 @@ fn main() {
                                 .with_inner_size(dioxus::desktop::LogicalSize::new(
                                     1280.0, 800.0,
                                 )),
-                        ),
+                        )
+                        // The icon goes on the builder AFTER with_window: with_window
+                        // replaces the inner builder wholesale, so an earlier
+                        // Config::with_icon call is silently dropped.
+                        .with_icon(app_icon()),
                 )
                 .launch(App);
         }));
@@ -192,25 +195,24 @@ enum Page {
 #[component]
 fn Logo() -> Element {
     rsx! {
+        // Monochrome shredding mark: a sheet is shredded into falling strips
+        // (theme off-white, single color).
         svg {
-            width: "32",
-            height: "32",
+            width: "30",
+            height: "30",
             view_box: "0 0 64 64",
-            rect { width: "64", height: "64", rx: "16", fill: "#101C2C" }
-            path { d: "M18 12h19l11 11v29H18z", fill: "#EAF2F7" }
-            path { d: "M37 12v12h11", fill: "#C8D9E5" }
-            path {
-                d: "M24 42l8-9 7 4 8-11",
-                fill: "none",
-                stroke: "#08B98B",
-                stroke_width: "3.2",
-                stroke_linecap: "round",
-                stroke_linejoin: "round"
-            }
-            circle { cx: "24", cy: "42", r: "2.5", fill: "#08B98B" }
-            circle { cx: "32", cy: "33", r: "2.5", fill: "#08B98B" }
-            circle { cx: "39", cy: "37", r: "2.5", fill: "#08B98B" }
-            circle { cx: "47", cy: "26", r: "3", fill: "#F5B94C" }
+            path { d: "M12 5 H32 L40 13 V25 H12 Z", fill: "#EAF2F7" }
+            path { d: "M32 5 V13 H40 Z", fill: "#EAF2F7", fill_opacity: "0.55" }
+            rect { x: "12", y: "29", width: "28", height: "4.5", rx: "1.75", fill: "#EAF2F7" }
+            rect { x: "14", y: "36.5", width: "3.2", height: "8", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "19.3", y: "36.5", width: "3.2", height: "12", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "24.6", y: "36.5", width: "3.2", height: "6", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "29.9", y: "36.5", width: "3.2", height: "13", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "14", y: "36.5", width: "3.2", height: "10", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "19.3", y: "36.5", width: "3.2", height: "15", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "24.6", y: "36.5", width: "3.2", height: "8", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "29.9", y: "36.5", width: "3.2", height: "16", rx: "1.6", fill: "#EAF2F7" }
+            rect { x: "35.2", y: "36.5", width: "3.2", height: "9", rx: "1.6", fill: "#EAF2F7" }
         }
     }
 }
