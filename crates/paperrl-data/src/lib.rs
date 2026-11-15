@@ -122,9 +122,11 @@ impl BarStore {
         Self { root: root.into() }
     }
 
-    /// Dataset file for one symbol and timeframe.
+    /// Dataset file for one symbol and timeframe (crypto pairs use their slug).
     pub fn path(&self, symbol: &Symbol, tf: Timeframe) -> PathBuf {
-        self.root.join(tf.slug()).join(format!("{symbol}.parquet"))
+        self.root
+            .join(tf.slug())
+            .join(format!("{}.parquet", symbol.file_slug()))
     }
 
     /// Writes bars, merging with anything already stored: fetched values win on
@@ -297,6 +299,27 @@ mod tests {
         let back = store.read(&sym, Timeframe::Day).unwrap();
         assert_eq!(back.len(), 3);
         assert_eq!(back[1].close, 12.0);
+    }
+
+    #[test]
+    fn crypto_pair_paths_are_fs_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BarStore::new(dir.path());
+        let sym = Symbol::parse("BTC/USD").unwrap();
+        assert_eq!(
+            store.path(&sym, Timeframe::Day).file_name().unwrap().to_str(),
+            Some("BTC-USD.parquet")
+        );
+        let bar = Bar {
+            timestamp: DateTime::from_timestamp(86_400, 0).unwrap(),
+            open: 50_000.0,
+            high: 51_000.0,
+            low: 49_000.0,
+            close: 50_500.0,
+            volume: 1_000.0,
+        };
+        store.write(&sym, Timeframe::Day, &[bar]).unwrap();
+        assert_eq!(store.read(&sym, Timeframe::Day).unwrap().len(), 1);
     }
 
     #[test]

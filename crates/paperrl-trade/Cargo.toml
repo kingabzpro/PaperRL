@@ -11,3 +11,6 @@ paperrl-data = { workspace = true }
 paperrl-sim = { workspace = true }
 paperrl-rl = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

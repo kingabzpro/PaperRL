@@ -113,6 +113,291 @@ pub fn rank_filtered<'a>(
     out
 }
 
+/// The verdict for one ticker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Buy,
+    Sell,
+    Hold,
+}
+
+/// Indicator values behind a recommendation, shown in the "why" panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Indicators {
+    pub price: f64,
+    /// Percent change of the last close vs the previous close.
+    pub change_pct: f64,
+    pub ema20: f64,
+    pub ema50: f64,
+    pub rsi14: f64,
+    pub macd_hist: f64,
+    pub ret5: f64,
+    pub ret20: f64,
+}
+
+/// The PPO checkpoint that contributed to a verdict.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelProvenance {
+    pub seed: u64,
+    /// Latest target equity weight the model produced, in [0, 1].
+    pub weight: f64,
+}
+
+/// A per-ticker Buy / Sell / Hold verdict with its reasoning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recommendation {
+    pub symbol: Symbol,
+    pub action: Action,
+    /// 0.5 (coin flip) to 1.0 (all signals agree).
+    pub confidence: f64,
+    pub indicators: Indicators,
+    /// Short human strings naming each contributing factor.
+    pub reasons: Vec<String>,
+    pub model: Option<ModelProvenance>,
+}
+
+/// Newest `ppo-<slug>-<seed>.bpk` in the model dir by file modification time.
+fn newest_checkpoint(model_dir: &Path, slug: &str) -> Option<(PathBuf, u64)> {
+    let mut best: Option<(std::time::SystemTime, PathBuf, u64)> = None;
+    for entry in std::fs::read_dir(model_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(&format!("ppo-{slug}-")) else {
+            continue;
+        };
+        let Some(seed_str) = rest.strip_suffix(".bpk") else {
+            continue;
+        };
+        let Ok(seed) = seed_str.parse::<u64>() else {
+            continue;
+        };
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _, _)| modified > *t) {
+            best = Some((modified, entry.path(), seed));
+        }
+    }
+    best.map(|(_, path, seed)| (path, seed))
+}
+
+/// Exponential moving average over closes; seeds with the first `n` values.
+/// Returns the EMA series from the seed point on, or empty without enough data.
+fn ema(closes: &[f64], n: usize) -> Vec<f64> {
+    if n == 0 || closes.len() < n {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(closes.len() - n + 1);
+    out.push(closes[..n].iter().sum::<f64>() / n as f64);
+    let k = 2.0 / (n as f64 + 1.0);
+    for &c in &closes[n..] {
+        let prev = *out.last().expect("seeded above");
+        out.push(prev + k * (c - prev));
+    }
+    out
+}
+
+/// Wilder's RSI; 50.0 (neutral) when there is not enough history.
+fn rsi(closes: &[f64], n: usize) -> f64 {
+    if n == 0 || closes.len() < n + 1 {
+        return 50.0;
+    }
+    let mut avg_gain = 0.0;
+    let mut avg_loss = 0.0;
+    for w in closes.windows(2).take(n) {
+        let d = w[1] - w[0];
+        if d >= 0.0 {
+            avg_gain += d;
+        } else {
+            avg_loss -= d;
+        }
+    }
+    avg_gain /= n as f64;
+    avg_loss /= n as f64;
+    for w in closes.windows(2).skip(n) {
+        let d = w[1] - w[0];
+        let (g, l) = if d >= 0.0 { (d, 0.0) } else { (0.0, -d) };
+        avg_gain = (avg_gain * (n as f64 - 1.0) + g) / n as f64;
+        avg_loss = (avg_loss * (n as f64 - 1.0) + l) / n as f64;
+    }
+    if avg_loss == 0.0 {
+        return 100.0;
+    }
+    let rs = avg_gain / avg_loss;
+    100.0 - 100.0 / (1.0 + rs)
+}
+
+/// MACD histogram: MACD line minus its 9-period signal line; 0.0 without
+/// enough history.
+fn macd_hist(closes: &[f64]) -> f64 {
+    let fast = ema(closes, 12);
+    let slow = ema(closes, 26);
+    if fast.is_empty() || slow.is_empty() {
+        return 0.0;
+    }
+    let min = fast.len().min(slow.len());
+    let macd: Vec<f64> = fast[fast.len() - min..]
+        .iter()
+        .zip(&slow[slow.len() - min..])
+        .map(|(f, s)| f - s)
+        .collect();
+    match (macd.last(), ema(&macd, 9).last()) {
+        (Some(m), Some(s)) => m - s,
+        _ => 0.0,
+    }
+}
+
+/// Scores one ticker from its daily bars. Fewer than 60 bars yields Hold
+/// with an explanation. `model` biases the verdict when a PPO checkpoint
+/// exists; `held_qty > 0` adds position context.
+pub fn recommend(
+    symbol: &Symbol,
+    bars: &[Bar],
+    model: Option<ModelProvenance>,
+    held_qty: f64,
+) -> Recommendation {
+    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let n = closes.len();
+    let price = closes.last().copied().unwrap_or(0.0);
+    if n < 60 {
+        return Recommendation {
+            symbol: symbol.clone(),
+            action: Action::Hold,
+            confidence: 0.5,
+            indicators: Indicators {
+                price,
+                change_pct: 0.0,
+                ema20: price,
+                ema50: price,
+                rsi14: 50.0,
+                macd_hist: 0.0,
+                ret5: 0.0,
+                ret20: 0.0,
+            },
+            reasons: vec!["Not enough history (need about 60 daily bars)".to_string()],
+            model,
+        };
+    }
+
+    let change_pct = (closes[n - 1] / closes[n - 2] - 1.0) * 100.0;
+    let ema20 = *ema(&closes, 20).last().expect("n >= 20");
+    let ema50 = *ema(&closes, 50).last().expect("n >= 50");
+    let rsi14 = rsi(&closes, 14);
+    let hist = macd_hist(&closes);
+    let (ret20, ret5, _) = momentum(bars).unwrap_or((0.0, 0.0, price));
+    let indicators = Indicators {
+        price,
+        change_pct,
+        ema20,
+        ema50,
+        rsi14,
+        macd_hist: hist,
+        ret5,
+        ret20,
+    };
+
+    // Weighted vote in [-1, 1]; trend and momentum carry the most weight.
+    // Each factor is normalized by the move size it should react to, so
+    // small noise stays near zero instead of flipping the verdict.
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+
+    let t1 = ((price / ema50 - 1.0) / 0.02).clamp(-1.0, 1.0);
+    score += 0.25 * t1;
+    if t1 > 0.1 {
+        reasons.push(format!("Price {price:.2} is above the 50-day EMA ({ema50:.2})"));
+    } else if t1 < -0.1 {
+        reasons.push(format!("Price {price:.2} is below the 50-day EMA ({ema50:.2})"));
+    }
+
+    let t2 = ((ema20 / ema50 - 1.0) / 0.01).clamp(-1.0, 1.0);
+    score += 0.20 * t2;
+    if t2 > 0.1 {
+        reasons.push("EMA20 is above EMA50 (uptrend)".to_string());
+    } else if t2 < -0.1 {
+        reasons.push("EMA20 is below EMA50 (downtrend)".to_string());
+    }
+
+    let m = (ret20 / 0.10).clamp(-1.0, 1.0);
+    score += 0.25 * m;
+    if ret20 > 0.02 {
+        reasons.push(format!("20-day return is {:+.1}%", ret20 * 100.0));
+    } else if ret20 < -0.02 {
+        reasons.push(format!("20-day return is {:+.1}%", ret20 * 100.0));
+    }
+
+    let md = (hist / (price * 0.01)).clamp(-1.0, 1.0);
+    score += 0.15 * md;
+    if hist > 0.0 {
+        reasons.push("MACD histogram is positive".to_string());
+    } else if hist < 0.0 {
+        reasons.push("MACD histogram is negative".to_string());
+    }
+
+    let r = if rsi14 >= 70.0 {
+        -(((rsi14 - 70.0) / 30.0).min(1.0))
+    } else if rsi14 <= 30.0 {
+        ((30.0 - rsi14) / 30.0).min(1.0)
+    } else {
+        0.0
+    };
+    score += 0.15 * r;
+    if rsi14 >= 70.0 {
+        reasons.push(format!("RSI is {rsi14:.0} (overbought)"));
+    } else if rsi14 <= 30.0 {
+        reasons.push(format!("RSI is {rsi14:.0} (oversold)"));
+    }
+
+    if let Some(mp) = model {
+        if mp.weight >= 0.6 {
+            score += 0.35;
+            reasons.push(format!(
+                "PPO model (seed {}) targets {:.0}% of equity",
+                mp.seed,
+                mp.weight * 100.0
+            ));
+        } else if mp.weight <= 0.2 {
+            score -= 0.35;
+            reasons.push(format!(
+                "PPO model (seed {}) stays near cash ({:.0}% weight)",
+                mp.seed,
+                mp.weight * 100.0
+            ));
+        } else {
+            reasons.push(format!(
+                "PPO model (seed {}) is neutral ({:.0}% weight)",
+                mp.seed,
+                mp.weight * 100.0
+            ));
+        }
+    }
+
+    let score = score.clamp(-1.0, 1.0);
+    let action = if score >= 0.3 {
+        Action::Buy
+    } else if score <= -0.3 {
+        Action::Sell
+    } else {
+        Action::Hold
+    };
+    let confidence = 0.5 + score.abs() / 2.0;
+
+    if held_qty > 0.0 {
+        reasons.push(format!("Currently holding {held_qty} shares"));
+        if action == Action::Sell {
+            reasons.push("Signals point to exiting the position".to_string());
+        }
+    }
+
+    Recommendation {
+        symbol: symbol.clone(),
+        action,
+        confidence,
+        indicators,
+        reasons,
+        model,
+    }
+}
+
 /// Hard limits enforced before any order is sent.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RiskLimits {
@@ -283,20 +568,20 @@ impl Default for AutoConfig {
     }
 }
 
-/// The strategy weight a symbol's checkpoint would take on the latest close,
-/// or None when no checkpoint exists or it cannot be loaded.
-fn latest_model_weight(model_dir: &Path, symbol: &str, bars: &[Bar]) -> Option<f64> {
-    let path = model_dir.join(format!("ppo-{symbol}-42.bpk"));
-    if !path.exists() {
-        return None;
-    }
+/// The strategy weight the symbol's newest checkpoint would take on the
+/// latest close, or None when no checkpoint exists or it cannot be loaded.
+fn latest_model_weight(model_dir: &Path, symbol: &str, bars: &[Bar]) -> Option<ModelProvenance> {
+    let slug = Symbol::parse(symbol)
+        .map(|s| s.file_slug())
+        .unwrap_or_else(|_| symbol.to_string());
+    let (path, seed) = newest_checkpoint(model_dir, &slug)?;
     let mut strategy = paperrl_rl::PpoStrategy::load(&path).ok()?;
     let mut weight = 0.0;
     let start = bars.len().saturating_sub(120);
     for bar in &bars[start..] {
         weight = strategy.on_close(bar, 0.0, 0.0);
     }
-    Some(weight)
+    Some(ModelProvenance { seed, weight })
 }
 
 async fn ensure_bars(
@@ -312,9 +597,14 @@ async fn ensure_bars(
         .map(|b| (now - b.timestamp).num_days() <= stale_days)
         .unwrap_or(false);
     if !fresh || bars.len() < LONG_WINDOW {
-        let fetched = client
-            .bars(symbol, Timeframe::Day, now - chrono::Duration::days(150), now)
-            .await?;
+        let fetched = match symbol.asset_class() {
+            paperrl_core::AssetClass::Crypto => client.crypto_bars(symbol, 150).await?,
+            paperrl_core::AssetClass::UsEquity => {
+                client
+                    .bars(symbol, Timeframe::Day, now - chrono::Duration::days(150), now)
+                    .await?
+            }
+        };
         let merged = paperrl_data::merge_bars(bars, fetched);
         let _ = store.write(symbol, Timeframe::Day, &merged);
         bars = merged;
@@ -417,8 +707,8 @@ pub async fn run_once(client: &AlpacaClient, cfg: &AutoConfig) -> paperrl_core::
     bars_by_symbol.sort_by(|a, b| a.0.cmp(b.0));
     for c in report.gainers.iter().take(cfg.long_count) {
         if let Some((_, bars)) = bars_by_symbol.iter().find(|(s, _)| *s == c.symbol) {
-            if let Some(w) = latest_model_weight(&cfg.model_dir, &c.symbol, *bars) {
-                model_weights.push((c.symbol.clone(), w));
+            if let Some(mp) = latest_model_weight(&cfg.model_dir, &c.symbol, *bars) {
+                model_weights.push((c.symbol.clone(), mp.weight));
             }
         }
     }
@@ -527,6 +817,134 @@ mod tests {
             avg_dollar_volume: 10_000_000.0,
             score,
         }
+    }
+
+    // Trend builders for the recommendation tests: strict up, strict down,
+    // and a low-noise chop that should stay neutral.
+    fn rising(n: usize) -> Vec<Bar> {
+        bars_with_closes(&(0..n).map(|i| 100.0 + i as f64).collect::<Vec<_>>())
+    }
+
+    fn falling(n: usize) -> Vec<Bar> {
+        bars_with_closes(&(0..n).map(|i| 220.0 - i as f64).collect::<Vec<_>>())
+    }
+
+    fn chop(n: usize) -> Vec<Bar> {
+        bars_with_closes(
+            &(0..n)
+                .map(|i| 100.0 + if i % 2 == 0 { 0.1 } else { -0.1 })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn sym(s: &str) -> Symbol {
+        Symbol::parse(s).unwrap()
+    }
+
+    #[test]
+    fn ema_trends() {
+        // EMA lags a trend: below the last close on the way up, above on the way down.
+        let up: Vec<f64> = (0..60).map(|i| 100.0 + i as f64).collect();
+        let down: Vec<f64> = (0..60).map(|i| 200.0 - i as f64).collect();
+        let up_ema = *ema(&up, 20).last().expect("enough history");
+        let down_ema = *ema(&down, 20).last().expect("enough history");
+        assert!(up_ema < *up.last().unwrap(), "uptrend EMA {up_ema} lags below close {}", up.last().unwrap());
+        assert!(down_ema > *down.last().unwrap(), "downtrend EMA {down_ema} lags above close {}", down.last().unwrap());
+    }
+
+    #[test]
+    fn rsi_bounds_and_direction() {
+        let up = rsi(&(0..40).map(|i| 100.0 + i as f64).collect::<Vec<_>>(), 14);
+        let down = rsi(&(0..40).map(|i| 200.0 - i as f64).collect::<Vec<_>>(), 14);
+        assert!(up > 70.0, "rsi up = {up}");
+        assert!(down < 30.0, "rsi down = {down}");
+        // too little history stays neutral
+        assert_eq!(rsi(&[1.0, 2.0], 14), 50.0);
+    }
+
+    #[test]
+    fn macd_hist_sign_matches_trend() {
+        // accelerating series keep the histogram away from zero
+        let up: Vec<f64> = (0..60).map(|i| 100.0 + (i as f64).powi(2) * 0.05).collect();
+        let down: Vec<f64> = (0..60).map(|i| 400.0 - (i as f64).powi(2) * 0.05).collect();
+        assert!(macd_hist(&up) > 0.0, "macd up = {}", macd_hist(&up));
+        assert!(macd_hist(&down) < 0.0, "macd down = {}", macd_hist(&down));
+        assert_eq!(macd_hist(&[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn recommend_buy_on_uptrend() {
+        let r = recommend(&sym("AAPL"), &rising(120), None, 0.0);
+        assert_eq!(r.action, Action::Buy);
+        assert!(r.confidence > 0.5);
+        assert!(!r.reasons.is_empty());
+        assert!(r.model.is_none());
+    }
+
+    #[test]
+    fn recommend_sell_on_downtrend() {
+        let r = recommend(&sym("AAPL"), &falling(120), None, 0.0);
+        assert_eq!(r.action, Action::Sell);
+        assert!(r.confidence > 0.5);
+    }
+
+    #[test]
+    fn recommend_hold_on_chop() {
+        let r = recommend(&sym("AAPL"), &chop(120), None, 0.0);
+        assert_eq!(r.action, Action::Hold);
+    }
+
+    #[test]
+    fn ppo_weight_biases_verdict() {
+        let buy = recommend(&sym("AAPL"), &chop(120), Some(ModelProvenance { seed: 42, weight: 0.9 }), 0.0);
+        assert_eq!(buy.action, Action::Buy);
+        assert!(buy.reasons.iter().any(|s| s.contains("42")), "model reason: {:?}", buy.reasons);
+        let sell = recommend(&sym("AAPL"), &chop(120), Some(ModelProvenance { seed: 42, weight: 0.05 }), 0.0);
+        assert_eq!(sell.action, Action::Sell);
+    }
+
+    #[test]
+    fn held_position_exit_reason() {
+        let r = recommend(&sym("AAPL"), &falling(120), None, 2.0);
+        assert_eq!(r.action, Action::Sell);
+        assert!(r.reasons.iter().any(|s| s.contains("exit")), "reasons: {:?}", r.reasons);
+    }
+
+    #[test]
+    fn needs_minimum_history() {
+        let r = recommend(&sym("AAPL"), &rising(10), None, 0.0);
+        assert_eq!(r.action, Action::Hold);
+        assert!(r.reasons.iter().any(|s| s.contains("history")));
+    }
+
+    #[test]
+    fn newest_checkpoint_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("ppo-AAPL-1.bpk");
+        let newer = dir.path().join("ppo-AAPL-42.bpk");
+        std::fs::write(&older, b"x").unwrap();
+        std::fs::write(&newer, b"x").unwrap();
+        let t = std::time::SystemTime::now();
+        std::fs::File::options().write(true).open(&older).unwrap().set_modified(t - std::time::Duration::from_secs(7200)).unwrap();
+        std::fs::File::options().write(true).open(&newer).unwrap().set_modified(t - std::time::Duration::from_secs(3600)).unwrap();
+        let (path, seed) = newest_checkpoint(dir.path(), "AAPL").unwrap();
+        assert_eq!(seed, 42);
+        assert!(path.ends_with("ppo-AAPL-42.bpk"));
+    }
+
+    #[test]
+    fn checkpoint_seed_parses_hyphen_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ppo-BTC-USD-42.bpk");
+        std::fs::write(&path, b"x").unwrap();
+        let (_, seed) = newest_checkpoint(dir.path(), "BTC-USD").unwrap();
+        assert_eq!(seed, 42);
+    }
+
+    #[test]
+    fn no_checkpoint_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(newest_checkpoint(dir.path(), "AAPL").is_none());
     }
 
     #[test]
