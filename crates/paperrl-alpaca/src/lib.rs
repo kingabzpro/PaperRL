@@ -3,7 +3,7 @@
 //! The trading client is always constructed against the paper API: PaperRL
 //! never talks to the live-money endpoint.
 
-use alpacars::data::enums::{Adjustment, TimeFrame, TimeFrameUnit};
+use alpacars::data::enums::{Adjustment, DataFeed, TimeFrame, TimeFrameUnit};
 use alpacars::data::historical::stock::{StockBarsRequest, StockHistoricalDataClient};
 use alpacars::trading::client::TradingClient;
 use chrono::{DateTime, Utc};
@@ -92,6 +92,10 @@ impl AlpacaClient {
             start: Some(start),
             end: Some(end),
             adjustment: Some(Adjustment::Split),
+            // The free Basic plan only serves the IEX feed; the API defaults
+            // to SIP and returns 403 without this.
+            // ponytail: make the feed configurable when a paid data plan is used.
+            feed: Some(DataFeed::Iex),
             ..Default::default()
         };
         let set = self.data.get_stock_bars(&req).await.map_err(other)?;
